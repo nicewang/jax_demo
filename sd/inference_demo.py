@@ -10,8 +10,7 @@ from flax.training import checkpoints
 from flax import jax_utils
 from IPython.display import display
 
-# 1. Use the real SD 1.5 model, and add from_pt=True to automatically convert weights
-model_id = "/kaggle/working/model_naruto"
+model_id = "runwayml/stable-diffusion-v1-5"
 print("Loading the base pipeline on CPU to prevent TPU OOM...")
 
 # [ULTIMATE MEMORY FIX]: Force JAX to load and convert the entire pipeline on the CPU!
@@ -23,15 +22,13 @@ with jax.default_device(cpu_device):
     print("Replacing with our fine-tuned UNet weights...")
     raw_checkpoint = checkpoints.restore_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=None)
     
-    # Force the restored checkpoint into bfloat16 to ensure it doesn't inflate memory
     unet_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), raw_checkpoint['params'])
     params["unet"] = unet_params
 
 print("Replicating clean parameters to all 8 TPU cores...")
 p_params = jax_utils.replicate(params)
 
-# 2. Define the prompt you want to test (can be changed to words from your fine-tuning data)
-prompt = "A red circle on a white background"
+prompt = "A drawing of Naruto Uzumaki"
 print(f"Testing prompt: '{prompt}'")
 
 prompts = [prompt] * jax.device_count()
