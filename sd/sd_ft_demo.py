@@ -12,7 +12,36 @@ from flax import jax_utils
 from diffusers import FlaxUNet2DConditionModel, FlaxDDPMScheduler, FlaxAutoencoderKL
 from transformers import CLIPTokenizer, FlaxCLIPTextModel
 from datasets import load_dataset
+from huggingface_hub import login
 import argparse
+
+def get_hf_token():
+    """Attempts to read the Hugging Face token from Kaggle Secrets, then local properties."""
+    # 1. First, try to get the token from Kaggle Secrets
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        token = user_secrets.get_secret("HF_TOKEN")
+        if token:
+            print("Successfully loaded HF_TOKEN from Kaggle Secrets.")
+            return token
+    except Exception as e:
+        print("Kaggle Secrets not available or HF_TOKEN not found. Trying settings.properties...")
+
+    # 2. Fallback to settings.properties if Kaggle Secrets fails
+    filepath = "settings.properties"
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Ignore empty lines and comments
+                if line and not line.startswith("#"):
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        if key.strip().upper() == "HF_TOKEN":
+                            print("Successfully loaded HF_TOKEN from settings.properties.")
+                            return value.strip()
+    return ""
 
 # ==========================================
 # 1. Configuration & Hyperparameters
@@ -20,6 +49,9 @@ import argparse
 class TrainConfig:
     pretrained_model_name_or_path = "runwayml/stable-diffusion-v1-5"
     dataset_name = "lambdalabs/pokemon-blip-captions"
+    
+    # [CRITICAL FIX]: Read your Hugging Face token automatically
+    hf_token = get_hf_token() 
     
     # On Kaggle TPU v5e-8, there are 8 cores. Batch size must be divisible by device count.
     batch_size = 8 
@@ -32,6 +64,13 @@ class TrainConfig:
     num_samples_to_test = 8 
 
 config = TrainConfig()
+
+# Automatically login to Hugging Face if a token is provided
+if config.hf_token:
+    print("Logging into Hugging Face Hub...")
+    login(token=config.hf_token)
+else:
+    print("WARNING: No HF token provided. Dataset download might fail if it's gated.")
 
 # ==========================================
 # 2. Load Real Dataset (Pokemon)

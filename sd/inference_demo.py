@@ -11,7 +11,7 @@ from flax import jax_utils
 from IPython.display import display
 
 # 1. Use the real SD 1.5 model, and add from_pt=True to automatically convert weights
-model_id = "runwayml/stable-diffusion-v1-5"
+model_id = "/kaggle/working/model_pokemon"
 print("Loading the base pipeline on CPU to prevent TPU OOM...")
 
 # [ULTIMATE MEMORY FIX]: Force JAX to load and convert the entire pipeline on the CPU!
