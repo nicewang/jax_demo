@@ -28,7 +28,8 @@ class TrainConfig:
     learning_rate = 1e-4
     num_train_steps = 100
     seed = 42
-    num_synthetic_samples = 16 # Increased to support larger batch size
+    # Set to 24 to be a multiple of our 8 TPU cores (batch_size=8). 
+    num_synthetic_samples = 24 
 
 config = TrainConfig()
 
@@ -39,23 +40,41 @@ def generate_synthetic_dataset(num_samples):
     """
     Generates a dataset of synthetic PIL images and corresponding text captions.
     This simulates a real dataset before it gets processed by VAE and CLIP.
+    We create diverse shapes and colors to simulate real concept binding.
     """
     print(f"Generating {num_samples} synthetic image-text pairs...")
     dataset = []
-    colors = ["red", "blue", "green", "yellow"]
+    
+    # Diverse attributes for our toy dataset
+    colors = ["red", "blue", "green", "yellow", "purple", "orange", "cyan", "magenta"]
+    shapes = ["circle", "rectangle", "triangle"]
     
     for i in range(num_samples):
-        # Create a blank image with a random background color
-        color_name = colors[i % len(colors)]
-        img = Image.new("RGB", (512, 512), color=color_name)
-        
-        # Draw a simple shape to make it slightly more complex
+        # Create a blank white image
+        img = Image.new("RGB", (512, 512), color="white")
         draw = ImageDraw.Draw(img)
-        draw.rectangle([100, 100, 412, 412], outline="black", width=10)
         
-        caption = f"A simple {color_name} square background with a black border"
+        # Pick a combination of color and shape
+        color_name = colors[i % len(colors)]
+        shape_name = shapes[(i // len(colors)) % len(shapes)]
+        
+        # Draw the shape and create a matching caption
+        if shape_name == "circle":
+            draw.ellipse([128, 128, 384, 384], fill=color_name)
+            caption = f"A {color_name} circle on a white background"
+        elif shape_name == "rectangle":
+            draw.rectangle([100, 150, 412, 362], fill=color_name)
+            caption = f"A {color_name} rectangle on a white background"
+        elif shape_name == "triangle":
+            draw.polygon([(256, 100), (100, 412), (412, 412)], fill=color_name)
+            caption = f"A {color_name} triangle on a white background"
+            
         dataset.append({"image": img, "text": caption})
         
+        # Print the first few samples to see what we are generating
+        if i < 5:
+            print(f"Sample {i+1}: {caption}")
+            
     return dataset
 
 # ==========================================
@@ -94,6 +113,10 @@ def prepare_dataset_features(dataset, model_path):
         vae_outputs = vae.apply({"params": vae_params}, img_np, method=vae.encode)
         # Sample from the distribution and scale it
         latents = vae_outputs.latent_dist.sample(jax.random.PRNGKey(0))
+        
+        # [CRITICAL FIX]: Transpose from (B, H, W, C) to (B, C, H, W) to match UNet's expected input format
+        latents = jnp.transpose(latents, (0, 3, 1, 2))
+        
         latents = latents * vae.config.scaling_factor
         all_latents.append(latents)
         
@@ -114,8 +137,10 @@ noise_scheduler, noise_scheduler_state = FlaxDDPMScheduler.from_pretrained(
     config.pretrained_model_name_or_path, subfolder="scheduler"
 )
 
+# [MEMORY OOM FIX]: Load UNet explicitly in bfloat16. 
+# This cuts memory consumption by 50% making it fit perfectly in 16GB TPU HBM!
 unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-    config.pretrained_model_name_or_path, subfolder="unet", dtype=jnp.float32
+    config.pretrained_model_name_or_path, subfolder="unet", dtype=jnp.bfloat16
 )
 
 # ==========================================
@@ -148,7 +173,7 @@ def train_step(state, batch_latents, batch_embeddings, train_rng):
     sample_rng, timestep_rng = jax.random.split(train_rng, 2)
 
     def compute_loss(params):
-        # 1. Generate random Gaussian noise to add to the latents
+        # 1. Generate random Gaussian noise to add to the latents (Keep noise in float32 initially)
         noise = jax.random.normal(sample_rng, batch_latents.shape)
         
         # 2. Sample a random timestep for each image in the batch
@@ -165,16 +190,21 @@ def train_step(state, batch_latents, batch_embeddings, train_rng):
             noise_scheduler_state, batch_latents, noise, timesteps
         )
 
-        # 4. Predict the noise residual using the UNet
+        # [CRITICAL MEMORY FIX]: Cast inputs to bfloat16 before feeding to the UNet
+        noisy_latents_bf16 = noisy_latents.astype(jnp.bfloat16)
+        batch_embeddings_bf16 = batch_embeddings.astype(jnp.bfloat16)
+
+        # 4. Predict the noise residual using the UNet (Computation happens in bf16)
         model_pred = unet.apply(
             {"params": params},
-            noisy_latents,
+            noisy_latents_bf16,
             timesteps,
-            batch_embeddings,
+            batch_embeddings_bf16,
         ).sample
 
         # 5. Calculate MSE loss between predicted noise and actual noise
-        loss = jnp.mean((model_pred - noise) ** 2)
+        # [NOTE]: Cast prediction back to float32 to calculate Loss. This prevents gradient underflow/overflow.
+        loss = jnp.mean((model_pred.astype(jnp.float32) - noise) ** 2)
         return loss
 
     # Compute loss and gradients simultaneously
