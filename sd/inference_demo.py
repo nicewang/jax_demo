@@ -11,7 +11,7 @@ from flax import jax_utils
 from IPython.display import display
 
 # 1. Use the real SD 1.5 model, and add from_pt=True to automatically convert weights
-model_id = "/kaggle/working/model_pokemon"
+model_id = "/kaggle/working/model_naruto"
 print("Loading the base pipeline on CPU to prevent TPU OOM...")
 
 # [ULTIMATE MEMORY FIX]: Force JAX to load and convert the entire pipeline on the CPU!
@@ -21,7 +21,7 @@ with jax.default_device(cpu_device):
     pipe, params = FlaxStableDiffusionPipeline.from_pretrained(model_id, dtype=jnp.bfloat16, from_pt=True)
 
     print("Replacing with our fine-tuned UNet weights...")
-    raw_checkpoint = checkpoints.restore_checkpoint(ckpt_dir="/kaggle/working/output_model", target=None)
+    raw_checkpoint = checkpoints.restore_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=None)
     
     # Force the restored checkpoint into bfloat16 to ensure it doesn't inflate memory
     unet_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), raw_checkpoint['params'])

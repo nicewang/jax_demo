@@ -48,9 +48,11 @@ def get_hf_token():
 # ==========================================
 class TrainConfig:
     pretrained_model_name_or_path = "runwayml/stable-diffusion-v1-5"
-    dataset_name = "lambdalabs/pokemon-blip-captions"
     
-    # [CRITICAL FIX]: Read your Hugging Face token automatically
+    # Using Naruto dataset instead! It has the exact same structure.
+    dataset_name = "lambdalabs/naruto-blip-captions"
+    
+    # Read your Hugging Face token automatically
     hf_token = get_hf_token() 
     
     # On Kaggle TPU v5e-8, there are 8 cores. Batch size must be divisible by device count.
@@ -73,15 +75,15 @@ else:
     print("WARNING: No HF token provided. Dataset download might fail if it's gated.")
 
 # ==========================================
-# 2. Load Real Dataset (Pokemon)
+# 2. Load Real Dataset (Naruto)
 # ==========================================
-def load_real_dataset(dataset_name, num_samples):
+def load_real_dataset(dataset_name, num_samples, hf_token=None):
     """
-    Downloads the Pokemon dataset from Hugging Face and extracts a small subset for testing.
+    Downloads the image dataset from Hugging Face and extracts a small subset for testing.
     """
     print(f"Downloading and loading '{dataset_name}' from Hugging Face...")
-    # Load the training split
-    dataset = load_dataset(dataset_name, split="train")
+    # Load the training split (pass token explicitly to avoid gated dataset errors)
+    dataset = load_dataset(dataset_name, split="train", token=hf_token)
     
     # Select only the first 'num_samples' for our quick test
     dataset = dataset.select(range(num_samples))
@@ -108,7 +110,7 @@ def load_real_dataset(dataset_name, num_samples):
 def prepare_dataset_features(dataset, model_path):
     print("Loading VAE and Text Encoder on CPU to prevent TPU OOM...")
     
-    # [ULTIMATE MEMORY FIX 1]: Load VAE and Text Encoder entirely on the CPU!
+    # Load VAE and Text Encoder entirely on the CPU!
     cpu_device = jax.devices("cpu")[0]
     
     with jax.default_device(cpu_device):
@@ -162,7 +164,7 @@ noise_scheduler, noise_scheduler_state = FlaxDDPMScheduler.from_pretrained(
 print("Initializing UNet and Optimizer on CPU first to prevent TPU OOM...")
 cpu_device = jax.devices("cpu")[0]
 
-# [ULTIMATE MEMORY FIX 2]: Load UNet on CPU first! 
+# Load UNet on CPU first
 with jax.default_device(cpu_device):
     unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
         config.pretrained_model_name_or_path, subfolder="unet", dtype=jnp.bfloat16, from_pt=True
@@ -231,8 +233,8 @@ def train_step(state, batch_latents, batch_embeddings, train_rng):
 # 7. Main Training Loop
 # ==========================================
 if __name__ == "__main__":
-    # Load Real Dataset instead of synthetic
-    raw_dataset = load_real_dataset(config.dataset_name, config.num_samples_to_test)
+    # Load Real Dataset instead of synthetic, passing the token explicitly
+    raw_dataset = load_real_dataset(config.dataset_name, config.num_samples_to_test, config.hf_token)
     train_latents, train_embeddings = prepare_dataset_features(raw_dataset, config.pretrained_model_name_or_path)
     
     print(f"Starting training loop on {num_devices} TPU cores...")
@@ -264,5 +266,5 @@ if __name__ == "__main__":
     
     state_to_save = jax_utils.unreplicate(state)
     from flax.training import checkpoints
-    checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/model_pokemon", target=state_to_save, step=config.num_train_steps, keep=1)
-    print("Model weights successfully saved to /kaggle/working/model_pokemon !")
+    checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=state_to_save, step=config.num_train_steps, keep=1)
+    print("Model weights successfully saved to /kaggle/working/model_naruto !")
