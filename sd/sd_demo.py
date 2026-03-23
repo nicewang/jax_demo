@@ -20,8 +20,7 @@ import argparse
 # ==========================================
 class TrainConfig:
     # Set to "runwayml/stable-diffusion-v1-5" for actual training.
-    # Using a tiny model by default to ensure it runs instantly on Kaggle without OOM or long downloads.
-    pretrained_model_name_or_path = "hf-internal-testing/tiny-stable-diffusion-pipe"
+    pretrained_model_name_or_path = "runwayml/stable-diffusion-v1-5"
     
     # On Kaggle TPU v5e-8, there are 8 cores. Batch size must be divisible by device count.
     batch_size = 8 
@@ -86,78 +85,103 @@ def prepare_dataset_features(dataset, model_path):
     Uses CLIP Text Encoder to encode texts into hidden states.
     Doing this BEFORE the training loop saves massive amounts of GPU/TPU memory.
     """
-    print("Loading VAE and Text Encoder for feature extraction...")
-    tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
-    text_encoder = FlaxCLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", dtype=jnp.float32)
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(model_path, subfolder="vae", dtype=jnp.float32)
+    print("Loading VAE and Text Encoder on CPU to prevent TPU OOM...")
     
-    all_latents = []
-    all_embeddings = []
+    # [ULTIMATE MEMORY FIX 1]: Force JAX to load VAE and Text Encoder entirely on the CPU!
+    # This prevents the TPU from bursting its memory limit during PyTorch->Flax conversion.
+    cpu_device = jax.devices("cpu")[0]
     
-    for item in dataset:
-        # 3.1 Encode Text
-        text_inputs = tokenizer(
-            item["text"], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="np"
-        )
-        # Get embeddings from the text encoder
-        text_embeds = text_encoder(text_inputs.input_ids)[0]
-        all_embeddings.append(text_embeds)
+    with jax.default_device(cpu_device):
+        tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+        text_encoder = FlaxCLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", dtype=jnp.float32, from_pt=True)
+        vae, vae_params = FlaxAutoencoderKL.from_pretrained(model_path, subfolder="vae", dtype=jnp.float32, from_pt=True)
         
-        # 3.2 Encode Image
-        # Convert PIL Image to normalized numpy array [-1, 1]
-        img_np = np.array(item["image"]).astype(np.float32) / 127.5 - 1.0
-        # Transpose to channel-first (1, 3, H, W)
-        img_np = np.transpose(img_np, (2, 0, 1))[None, ...] 
+        all_latents = []
+        all_embeddings = []
         
-        # Get latents from VAE
-        vae_outputs = vae.apply({"params": vae_params}, img_np, method=vae.encode)
-        # Sample from the distribution and scale it
-        latents = vae_outputs.latent_dist.sample(jax.random.PRNGKey(0))
+        for item in dataset:
+            # 3.1 Encode Text
+            text_inputs = tokenizer(
+                item["text"], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="np"
+            )
+            # Get embeddings from the text encoder
+            text_embeds = text_encoder(text_inputs.input_ids)[0]
+            # Convert immediately to NumPy to detach from JAX computation buffers
+            all_embeddings.append(np.array(text_embeds))
+            
+            # 3.2 Encode Image
+            # Convert PIL Image to normalized numpy array [-1, 1]
+            img_np = np.array(item["image"]).astype(np.float32) / 127.5 - 1.0
+            # Transpose to channel-first (1, 3, H, W)
+            img_np = np.transpose(img_np, (2, 0, 1))[None, ...] 
+            
+            # Get latents from VAE
+            vae_outputs = vae.apply({"params": vae_params}, img_np, method=vae.encode)
+            # Sample from the distribution and scale it
+            latents = vae_outputs.latent_dist.sample(jax.random.PRNGKey(0))
+            
+            # Transpose from (B, H, W, C) to (B, C, H, W) to match UNet's expected input format
+            latents = jnp.transpose(latents, (0, 3, 1, 2))
+            latents = latents * vae.config.scaling_factor
+            
+            # Convert immediately to NumPy to detach from JAX computation buffers
+            all_latents.append(np.array(latents))
+            
+        # Concatenate all features into large NumPy arrays (These live safely in system RAM)
+        latents_array = np.concatenate(all_latents, axis=0)
+        embeddings_array = np.concatenate(all_embeddings, axis=0)
         
-        # [CRITICAL FIX]: Transpose from (B, H, W, C) to (B, C, H, W) to match UNet's expected input format
-        latents = jnp.transpose(latents, (0, 3, 1, 2))
-        
-        latents = latents * vae.config.scaling_factor
-        all_latents.append(latents)
-        
-    # Concatenate all features into large JAX arrays
-    latents_array = jnp.concatenate(all_latents, axis=0)
-    embeddings_array = jnp.concatenate(all_embeddings, axis=0)
-    
     print(f"Extracted Latents shape: {latents_array.shape}")
     print(f"Extracted Embeddings shape: {embeddings_array.shape}")
+    
+    # Free up CPU memory
+    import gc
+    del vae, vae_params, text_encoder, tokenizer, all_latents, all_embeddings
+    gc.collect()
     
     return latents_array, embeddings_array
 
 # ==========================================
 # 4. Initialize UNet and Scheduler
 # ==========================================
-print("Initializing Scheduler and UNet...")
+print("Initializing Scheduler...")
+# Scheduler config is a tiny JSON, safe to initialize on TPU
 noise_scheduler, noise_scheduler_state = FlaxDDPMScheduler.from_pretrained(
     config.pretrained_model_name_or_path, subfolder="scheduler"
 )
 
-# [MEMORY OOM FIX]: Load UNet explicitly in bfloat16. 
-# This cuts memory consumption by 50% making it fit perfectly in 16GB TPU HBM!
-unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-    config.pretrained_model_name_or_path, subfolder="unet", dtype=jnp.bfloat16
-)
+print("Initializing UNet and Optimizer on CPU first to prevent TPU OOM...")
+cpu_device = jax.devices("cpu")[0]
+
+# [ULTIMATE MEMORY FIX 2]: Load UNet on CPU first! 
+# Converting 3.4GB of PyTorch FP32 weights to JAX BF16 will spike memory to >10GB. 
+# We let the Kaggle CPU absorb this massive spike.
+with jax.default_device(cpu_device):
+    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
+        config.pretrained_model_name_or_path, subfolder="unet", dtype=jnp.bfloat16, from_pt=True
+    )
+
+    # Switch from AdamW to Adafactor!
+    # Adafactor factors momentum matrices, saving Gigabytes of memory.
+    tx = optax.adafactor(
+        learning_rate=config.learning_rate,
+        multiply_by_parameter_scale=False
+    )
+
+    # Create the training state entirely in CPU RAM
+    state = train_state.TrainState.create(
+        apply_fn=unet.apply,
+        params=unet_params,
+        tx=tx,
+    )
 
 # ==========================================
-# 5. Set up Optimizer and Train State
+# 5. Replicate State for TPU Parallelism
 # ==========================================
-tx = optax.adamw(learning_rate=config.learning_rate, weight_decay=1e-2)
-
-# TrainState encapsulates model parameters and optimizer state
-state = train_state.TrainState.create(
-    apply_fn=unet.apply,
-    params=unet_params,
-    tx=tx,
-)
-
-# REPLICATE STATE FOR TPU: Copy the model state to all available TPU cores (8 on Kaggle TPU v5e-8)
 num_devices = jax.device_count()
-print(f"Number of available devices (TPU cores): {num_devices}")
+print(f"Replicating clean model parameters to {num_devices} TPU cores...")
+# [ULTIMATE MEMORY FIX 3]: Now that the parameters are cleanly converted and packed into 'state',
+# we efficiently broadcast them from the CPU directly into the 8 TPU cores!
 state = jax_utils.replicate(state)
 
 # ==========================================
@@ -190,7 +214,7 @@ def train_step(state, batch_latents, batch_embeddings, train_rng):
             noise_scheduler_state, batch_latents, noise, timesteps
         )
 
-        # [CRITICAL MEMORY FIX]: Cast inputs to bfloat16 before feeding to the UNet
+        # Cast inputs to bfloat16 before feeding to the UNet
         noisy_latents_bf16 = noisy_latents.astype(jnp.bfloat16)
         batch_embeddings_bf16 = batch_embeddings.astype(jnp.bfloat16)
 
@@ -203,7 +227,7 @@ def train_step(state, batch_latents, batch_embeddings, train_rng):
         ).sample
 
         # 5. Calculate MSE loss between predicted noise and actual noise
-        # [NOTE]: Cast prediction back to float32 to calculate Loss. This prevents gradient underflow/overflow.
+        # Cast prediction back to float32 to calculate Loss. This prevents gradient underflow/overflow.
         loss = jnp.mean((model_pred.astype(jnp.float32) - noise) ** 2)
         return loss
 
@@ -263,7 +287,6 @@ if __name__ == "__main__":
 
     print("Training finished successfully!")
     
-    # Optional: Save weights (unreplicate the state first!)
-    # state_to_save = jax_utils.unreplicate(state)
-    # from flax.training import checkpoints
-    # checkpoints.save_checkpoint(ckpt_dir="kaggle/working/output_model", target=state_to_save, step=config.num_train_steps, keep=1)
+    state_to_save = jax_utils.unreplicate(state)
+    from flax.training import checkpoints
+    checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/output_model", target=state_to_save, step=config.num_train_steps, keep=1)
