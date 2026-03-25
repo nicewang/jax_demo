@@ -40,6 +40,7 @@ with jax.default_device(cpu_device):
         MODEL_ID,
         dtype=jnp.bfloat16,
         from_pt=True,
+        safety_checker=None,
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
