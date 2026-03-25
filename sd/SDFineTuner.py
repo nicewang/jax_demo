@@ -1,7 +1,17 @@
 import os
-# CRITICAL: Prevent JAX from pre-allocating all TPU memory!
-# Must be set before importing jax.
+
+# ==============================================================================
+# CRITICAL C++ FIXES FOR KAGGLE TPU KERNEL RESTARTS
+# ==============================================================================
+# 1. Prevent JAX from pre-allocating all TPU memory
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+# 2. Prevent "Thread handle creation failed" (EAGAIN/11) C++ crashes.
+# Kaggle containers have a strict thread limit. XLA/TSL tries to aggressively 
+# allocate huge thread pools for operations. We MUST limit them here.
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false"
 
 import gc
 import json
@@ -10,7 +20,9 @@ import psutil
 import argparse
 import functools
 import numpy as np
-import matplotlib.pyplot as plt
+
+# 3. Prevent matplotlib from silently starting background GUI threads
+# (Moved to standalone plotting function to avoid interfering with JAX)
 
 import jax
 import jax.numpy as jnp
@@ -66,10 +78,55 @@ class TrainConfig:
     metrics_dir = "/kaggle/working"
 
 
+def create_train_step(unet, noise_scheduler, noise_scheduler_state):
+    """
+    Factory function to isolate JAX pmap from class scope.
+    This prevents memory leaks during compilation.
+    """
+    @functools.partial(jax.pmap, axis_name='batch')
+    def train_step(state, batch_latents, batch_embeddings, train_rng):
+        sample_rng, timestep_rng = jax.random.split(train_rng, 2)
+
+        def compute_loss(params):
+            noise = jax.random.normal(sample_rng, batch_latents.shape)
+            bsz = batch_latents.shape[0]
+            timesteps = jax.random.randint(
+                timestep_rng, (bsz,), 0, noise_scheduler.config.num_train_timesteps,
+            )
+
+            noisy_latents = noise_scheduler.add_noise(
+                noise_scheduler_state, batch_latents, noise, timesteps
+            )
+
+            noisy_latents_bf16 = noisy_latents.astype(jnp.bfloat16)
+            batch_embeddings_bf16 = batch_embeddings.astype(jnp.bfloat16)
+
+            model_pred = unet.apply(
+                {"params": params},
+                noisy_latents_bf16,
+                timesteps,
+                batch_embeddings_bf16,
+            ).sample
+
+            loss = jnp.mean((model_pred.astype(jnp.float32) - noise) ** 2)
+            return loss
+
+        grad_fn = jax.value_and_grad(compute_loss)
+        loss, grads = grad_fn(state.params)
+        
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        loss = jax.lax.pmean(loss, axis_name='batch')
+        
+        state = state.apply_gradients(grads=grads)
+        return state, loss
+
+    return train_step
+
+
 class SDFineTuner:
     """
     Encapsulates the Stable Diffusion fine-tuning process on TPUs using JAX/Flax.
-    Tracks performance metrics (CPU, RAM, TPU Mem, Loss) and visualizes them.
+    Tracks performance metrics (Algorithm, CPU, RAM, TPU Mem) and visualizes them.
     """
     def __init__(self, config=None):
         self.config = config or TrainConfig()
@@ -144,62 +201,17 @@ class SDFineTuner:
         
         return latents_array, embeddings_array
 
-    def plot_metrics(self, history):
-        """Saves a plot of the training metrics."""
-        print("Generating and saving training metrics plot...")
-        steps = history['step']
-        
-        fig, axs = plt.subplots(2, 2, figsize=(12, 10))
-        fig.suptitle('Training Performance Metrics', fontsize=16)
-
-        # 1. Loss
-        axs[0, 0].plot(steps, history['loss'], color='tab:red', marker='o', markersize=3)
-        axs[0, 0].set_title('Training Loss')
-        axs[0, 0].set_xlabel('Step')
-        axs[0, 0].set_ylabel('Loss')
-        axs[0, 0].grid(True)
-
-        # 2. CPU Usage
-        axs[0, 1].plot(steps, history['cpu_percent'], color='tab:blue')
-        axs[0, 1].set_title('CPU Usage (%)')
-        axs[0, 1].set_xlabel('Step')
-        axs[0, 1].set_ylabel('Percentage (%)')
-        axs[0, 1].grid(True)
-        axs[0, 1].set_ylim(0, 100)
-
-        # 3. System RAM
-        axs[1, 0].plot(steps, history['ram_gb'], color='tab:green')
-        axs[1, 0].set_title('System RAM Usage (GB)')
-        axs[1, 0].set_xlabel('Step')
-        axs[1, 0].set_ylabel('GB')
-        axs[1, 0].grid(True)
-
-        # 4. TPU Memory
-        axs[1, 1].plot(steps, history['tpu_mem_gb'], color='tab:purple')
-        axs[1, 1].set_title('TPU Memory Usage (GB) - Device 0')
-        axs[1, 1].set_xlabel('Step')
-        axs[1, 1].set_ylabel('GB')
-        axs[1, 1].grid(True)
-
-        plt.tight_layout()
-        plot_path = os.path.join(self.config.metrics_dir, "training_metrics.png")
-        plt.savefig(plot_path)
-        plt.close()
-        print(f"Metrics plot saved to: {plot_path}")
-
-        # Save raw JSON data
-        json_path = os.path.join(self.config.metrics_dir, "training_metrics.json")
-        with open(json_path, 'w') as f:
-            json.dump(history, f, indent=4)
-        print(f"Metrics raw data saved to: {json_path}")
-
     def fine_tune(self):
-        """Main training workflow: loads data, initializes models, runs loop, and records metrics."""
+        """Main training workflow."""
         # 1. Data Preparation
         raw_dataset = self.load_real_dataset()
         train_latents, train_embeddings = self.prepare_dataset_features(raw_dataset)
         
-        # 2. Model Initialization (on CPU first to avoid TPU OOM)
+        # Free up huge amounts of System RAM before UNet initializes.
+        del raw_dataset
+        gc.collect()
+        
+        # 2. Model Initialization
         print("Initializing Scheduler...")
         noise_scheduler, noise_scheduler_state = FlaxDDPMScheduler.from_pretrained(
             self.config.pretrained_model_name_or_path, subfolder="scheduler"
@@ -212,7 +224,7 @@ class SDFineTuner:
             unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
                 self.config.pretrained_model_name_or_path, subfolder="unet", dtype=jnp.bfloat16, from_pt=True
             )
-            # Adafactor optimizer to save huge TPU memory
+            # Adafactor optimizer
             tx = optax.adafactor(
                 learning_rate=self.config.learning_rate,
                 multiply_by_parameter_scale=False
@@ -228,43 +240,8 @@ class SDFineTuner:
         print(f"Replicating clean model parameters to {num_devices} TPU cores...")
         state = jax_utils.replicate(state)
 
-        # 4. Define PMAP-compiled Train Step
-        @functools.partial(jax.pmap, axis_name='batch')
-        def train_step(state, batch_latents, batch_embeddings, train_rng):
-            sample_rng, timestep_rng = jax.random.split(train_rng, 2)
-
-            def compute_loss(params):
-                noise = jax.random.normal(sample_rng, batch_latents.shape)
-                bsz = batch_latents.shape[0]
-                timesteps = jax.random.randint(
-                    timestep_rng, (bsz,), 0, noise_scheduler.config.num_train_timesteps,
-                )
-
-                noisy_latents = noise_scheduler.add_noise(
-                    noise_scheduler_state, batch_latents, noise, timesteps
-                )
-
-                noisy_latents_bf16 = noisy_latents.astype(jnp.bfloat16)
-                batch_embeddings_bf16 = batch_embeddings.astype(jnp.bfloat16)
-
-                model_pred = unet.apply(
-                    {"params": params},
-                    noisy_latents_bf16,
-                    timesteps,
-                    batch_embeddings_bf16,
-                ).sample
-
-                loss = jnp.mean((model_pred.astype(jnp.float32) - noise) ** 2)
-                return loss
-
-            grad_fn = jax.value_and_grad(compute_loss)
-            loss, grads = grad_fn(state.params)
-            
-            grads = jax.lax.pmean(grads, axis_name='batch')
-            loss = jax.lax.pmean(loss, axis_name='batch')
-            
-            state = state.apply_gradients(grads=grads)
-            return state, loss
+        # 4. Bind the factory function strictly without memory leaks
+        train_step_fn = create_train_step(unet, noise_scheduler, noise_scheduler_state)
 
         # 5. Training Loop
         print(f"Starting training loop on {num_devices} TPU cores...")
@@ -273,11 +250,9 @@ class SDFineTuner:
         num_batches = len(train_latents) // self.config.batch_size
         batch_size_per_device = self.config.batch_size // num_devices
         
-        # Initialize metrics history tracking
+        # Track metrics including TPU
         history = {'step': [], 'loss': [], 'cpu_percent': [], 'ram_gb': [], 'tpu_mem_gb': []}
-        
-        # Initialize CPU usage baseline (psutil needs a baseline call)
-        psutil.cpu_percent()
+        psutil.cpu_percent(interval=None) # Initialize baseline
 
         for step in range(self.config.num_train_steps):
             rng, step_rng = jax.random.split(rng, 2)
@@ -293,14 +268,14 @@ class SDFineTuner:
             b_latents = b_latents.reshape((num_devices, batch_size_per_device) + b_latents.shape[1:])
             b_embeddings = b_embeddings.reshape((num_devices, batch_size_per_device) + b_embeddings.shape[1:])
             
-            state, loss = train_step(state, b_latents, b_embeddings, step_rngs)
+            state, loss = train_step_fn(state, b_latents, b_embeddings, step_rngs)
             
             # --- Metrics Collection ---
             loss_val = float(jax.device_get(loss[0]))
             cpu_util = psutil.cpu_percent()
             ram_used = psutil.virtual_memory().used / (1024**3)
             
-            # Safely fetch TPU memory allocation (JAX >= 0.4.x behavior)
+            # Safely get TPU memory now that thread exhaustion is fixed
             try:
                 tpu_stats = jax.local_devices()[0].memory_stats()
                 tpu_mem = tpu_stats.get('bytes_in_use', 0) / (1024**3)
@@ -334,14 +309,74 @@ class SDFineTuner:
         )
         print(f"Model weights successfully saved to {self.config.output_dir} !")
 
-        # 7. Generate Metrics Plot
-        self.plot_metrics(history)
+        # Save raw JSON data for future analysis
+        json_path = os.path.join(self.config.metrics_dir, "training_metrics.json")
+        with open(json_path, 'w') as f:
+            json.dump(history, f, indent=4)
+        print(f"Metrics raw data saved to: {json_path}")
         
         return history
+
+# ==========================================
+# Standalone Plotting Function
+# ==========================================
+def plot_training_metrics(history, metrics_dir):
+    """Generates and saves a plot of the training metrics after fine-tuning completes."""
+    print("Generating and saving training metrics plot...")
+    
+    # Import matplotlib ONLY here, after all JAX/XLA operations are fully complete
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    
+    steps = history['step']
+    
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Stable Diffusion Fine-Tuning Performance Metrics', fontsize=16)
+
+    # 1. Algorithm Metric: Loss
+    axs[0, 0].plot(steps, history['loss'], color='tab:red', marker='o', markersize=3)
+    axs[0, 0].set_title('Training Loss')
+    axs[0, 0].set_xlabel('Step')
+    axs[0, 0].set_ylabel('Loss')
+    axs[0, 0].grid(True)
+
+    # 2. Performance Metric: CPU Usage
+    axs[0, 1].plot(steps, history['cpu_percent'], color='tab:blue')
+    axs[0, 1].set_title('CPU Usage (%)')
+    axs[0, 1].set_xlabel('Step')
+    axs[0, 1].set_ylabel('Percentage (%)')
+    axs[0, 1].grid(True)
+    axs[0, 1].set_ylim(0, 100)
+
+    # 3. Performance Metric: System RAM
+    axs[1, 0].plot(steps, history['ram_gb'], color='tab:green')
+    axs[1, 0].set_title('System RAM Usage (GB)')
+    axs[1, 0].set_xlabel('Step')
+    axs[1, 0].set_ylabel('GB')
+    axs[1, 0].grid(True)
+
+    # 4. Performance Metric: TPU Memory
+    axs[1, 1].plot(steps, history['tpu_mem_gb'], color='tab:purple')
+    axs[1, 1].set_title('TPU Memory Usage (GB) - Device 0')
+    axs[1, 1].set_xlabel('Step')
+    axs[1, 1].set_ylabel('GB')
+    axs[1, 1].grid(True)
+
+    plt.tight_layout()
+    plot_path = os.path.join(metrics_dir, "training_metrics.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Metrics plot saved to: {plot_path}")
 
 # ==========================================
 # Example usage: 1-line invocation
 # ==========================================
 if __name__ == "__main__":
-    # Create the tuner instance and run the pipeline
-    metrics_history = SDFineTuner().fine_tune()
+    config = TrainConfig()
+    
+    # 1. Run the fine-tuner (which tracks metrics and returns the dictionary)
+    metrics_history = SDFineTuner(config).fine_tune()
+    
+    # 2. Generate the plot safely after training is entirely complete
+    plot_training_metrics(metrics_history, config.metrics_dir)
