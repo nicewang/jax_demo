@@ -264,7 +264,34 @@ if __name__ == "__main__":
 
     print("Training finished successfully!")
     
-    state_to_save = jax_utils.unreplicate(state)
+    # state_to_save = jax_utils.unreplicate(state)
+    # from flax.training import checkpoints
+    # checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=state_to_save, step=config.num_train_steps, keep=1)
+    # print("Model weights successfully saved to /kaggle/working/model_naruto !")
+
+
+    # 把这两行：
+    # state_to_save = jax_utils.unreplicate(state)
+    # checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=state_to_save, step=config.num_train_steps, keep=1)
+
     from flax.training import checkpoints
-    checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=state_to_save, step=config.num_train_steps, keep=1)
+    from flax import jax_utils
+
+    unreplicated = jax_utils.unreplicate(state)
+
+    # Save only the UNet params (already bfloat16 from training),
+    # not the full TrainState — inference only needs the weights,
+    # not the optimizer state or step counter.
+    unet_params_to_save = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.bfloat16),
+        unreplicated.params
+    )
+
+    checkpoints.save_checkpoint(
+        ckpt_dir="/kaggle/working/model_naruto",
+        target={"params": unet_params_to_save},
+        step=config.num_train_steps,
+        keep=1,
+        overwrite=True,
+    )
     print("Model weights successfully saved to /kaggle/working/model_naruto !")
