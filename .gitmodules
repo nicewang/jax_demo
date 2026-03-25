@@ -1,0 +1,3 @@
+[submodule "sd/model_naruto_weights"]
+	path = sd/model_naruto_weights
+	url = https://hf-mirror.com/nicewang/sd-naruto-tpu
