@@ -1,83 +1,158 @@
 import os
-# Prevent JAX from pre-allocating all TPU memory!
+# CRITICAL: Must be set before importing JAX.
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]   = "platform"
+
+import gc
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import gc # Import garbage collection
 from diffusers import FlaxStableDiffusionPipeline
-from flax.training import checkpoints
 from flax import jax_utils
-from flax.core import unfreeze, freeze
+from flax.core import freeze, unfreeze
+from flax.training import checkpoints
 from IPython.display import display
 
-model_id = "runwayml/stable-diffusion-v1-5"
-print("Loading the base pipeline on CPU to prevent TPU OOM...")
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Device setup — use only 1 TPU core for single-image inference.
+# Using all 8 cores would force jax_utils.replicate() to create 8 copies of
+# every parameter tensor in CPU RAM before the first tensor reaches the TPU.
+# ──────────────────────────────────────────────────────────────────────────────
 cpu_device = jax.devices("cpu")[0]
+single_tpu = jax.devices()[:1]
 
+print(f"CPU: {cpu_device}")
+print(f"TPU: {single_tpu}")
+
+MODEL_ID       = "runwayml/stable-diffusion-v1-5"
+CHECKPOINT_DIR = "/kaggle/working/model_naruto"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 1 — Load the base pipeline on CPU.
+#
+# dtype=bfloat16 halves every component's footprint versus float32.
+# Loading on CPU keeps everything out of TPU HBM until we explicitly move it.
+# ──────────────────────────────────────────────────────────────────────────────
+print("Loading base pipeline on CPU…")
 with jax.default_device(cpu_device):
-    pipe, params = FlaxStableDiffusionPipeline.from_pretrained(model_id, dtype=jnp.bfloat16, from_pt=True)
-    
-    # Unfreeze the dictionary so we can modify it safely
+    pipe, params = FlaxStableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        dtype=jnp.bfloat16,
+        from_pt=True,
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 2 — Swap in the fine-tuned UNet weights.
+#
+# The training script now saves ONLY the bfloat16 UNet params under the key
+# "params", so:
+#   raw_ckpt["params"]  →  the UNet weight pytree, already bfloat16.
+#
+# There is NO dtype cast needed here — the weights are already in the right
+# format.  No float32 intermediate copy is ever created.
+#
+# Memory peak for this step:
+#   base UNet (bfloat16) + fine-tuned UNet (bfloat16) simultaneously.
+#   We minimise this window by deleting the base UNet before loading the ckpt.
+# ──────────────────────────────────────────────────────────────────────────────
+print("Replacing base UNet with fine-tuned Naruto weights…")
+with jax.default_device(cpu_device):
     params = unfreeze(params)
 
-    print("Freeing original UNet from CPU RAM to prevent kernel crash...")
+    # Free the base UNet first so we never hold two UNets at once.
     del params["unet"]
     gc.collect()
 
-    print("Replacing with our fine-tuned UNet weights...")
-    raw_checkpoint = checkpoints.restore_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=None)
-    
-    print("Casting UNet to bfloat16...")
-    # Directly assign and cast to bfloat16
-    params["unet"] = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), raw_checkpoint['params'])
-    
-    print("Freeing temporary checkpoint variables...")
-    del raw_checkpoint
+    # Load the checkpoint.  target=None → raw dict, no pytree shape hint needed.
+    raw_ckpt = checkpoints.restore_checkpoint(ckpt_dir=CHECKPOINT_DIR, target=None)
+
+    # raw_ckpt["params"] is the bfloat16 UNet param tree saved by training.
+    # No cast required — assign directly.
+    params["unet"] = raw_ckpt["params"]
+
+    del raw_ckpt
     gc.collect()
 
-    print("Casting remaining components to bfloat16...")
-    for key in params.keys():
-        if key != "unet":
-            params[key] = jax.tree_util.tree_map(lambda x: jnp.array(x, dtype=jnp.bfloat16), params[key])
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3 — Verify dtypes for all components.
+#
+# from_pretrained with dtype=bfloat16 should have handled the base components,
+# but we do a lightweight check here.  We ONLY cast if a component is not
+# already bfloat16, avoiding the double-buffer spike for components that are
+# already correct.
+# ──────────────────────────────────────────────────────────────────────────────
+print("Verifying component dtypes…")
+with jax.default_device(cpu_device):
+    for key in list(params.keys()):
+        leaves = jax.tree_util.tree_leaves(params[key])
+        if not leaves:
+            continue
+        actual_dtype = leaves[0].dtype
+        if actual_dtype != jnp.bfloat16:
+            print(f"  Casting {key}: {actual_dtype} → bfloat16")
+            params[key] = jax.tree_util.tree_map(
+                lambda x: x.astype(jnp.bfloat16), params[key]
+            )
+        else:
+            print(f"  {key}: bfloat16 ✓")
     gc.collect()
 
-print("Replicating parameters to TPUs component by component to save RAM...")
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 4 — Move parameters to the single TPU core.
+#
+# We process one component at a time.  After each replicate() call we call
+# jax.block_until_ready() to force XLA to complete the DMA transfer before
+# we delete the CPU-side source.  Without this, the async XLA runtime may hold
+# a hidden reference and the CPU buffer will not be freed until much later.
+# ──────────────────────────────────────────────────────────────────────────────
+print("Replicating parameters to TPU core 0…")
 p_params = {}
-
-# [ULTIMATE MEMORY FIX]: Replicate one component at a time, and delete the CPU copy immediately!
 for key in list(params.keys()):
-    print(f" -> Replicating {key} to 8 TPUs...")
-    p_params[key] = jax_utils.replicate(params[key])
-    
-    # Delete the CPU version immediately after it is sent to TPUs to prevent RAM spikes
-    del params[key] 
+    print(f"  → {key}")
+    p_params[key] = jax_utils.replicate(params[key], devices=single_tpu)
+    jax.block_until_ready(p_params[key])   # wait for transfer to finish
+    del params[key]
     gc.collect()
 
-# Freeze the dictionary back to its required Flax format
 p_params = freeze(p_params)
+print("All parameters on TPU.")
 
-prompt = "A drawing of Naruto Uzumaki"
-print(f"Testing prompt: '{prompt}'")
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 5 — Run inference.
+# ──────────────────────────────────────────────────────────────────────────────
+PROMPT = "A drawing of Naruto Uzumaki"
+print(f"\nPrompt: '{PROMPT}'")
 
-prompts = [prompt] * jax.device_count()
-prompt_ids = pipe.prepare_inputs(prompts)
-p_prompt_ids = jax_utils.replicate(prompt_ids)
+prompts      = [PROMPT] * len(single_tpu)
+prompt_ids   = pipe.prepare_inputs(prompts)
+p_prompt_ids = jax_utils.replicate(prompt_ids, devices=single_tpu)
+prng_seed    = jax.random.split(jax.random.PRNGKey(42), len(single_tpu))
 
-prng_seed = jax.random.split(jax.random.PRNGKey(42), jax.device_count())
-
-print("Generating image via TPU, this might take a moment...")
 output = pipe(
     prompt_ids=p_prompt_ids,
     params=p_params,
     prng_seed=prng_seed,
     num_inference_steps=50,
-    jit=True
+    jit=True,
 )
 
-print("Generation complete!")
-images = pipe.numpy_to_pil(np.asarray(output.images[0]))
-display(images[0])
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 6 — Convert to PIL and display.
+#
+# output.images shape: (num_devices, batch_per_device, H, W, C)
+#                    = (1, 1, 512, 512, 3) with our single-device setup.
+#
+# block_until_ready() ensures the TPU computation is complete before we
+# initiate the device→host copy.  reshape(-1, H, W, C) collapses the
+# leading (num_devices, batch) dims so numpy_to_pil gets the expected layout.
+# ──────────────────────────────────────────────────────────────────────────────
+print("Transferring result to host…")
+jax.block_until_ready(output.images)
+
+H, W, C    = output.images.shape[-3:]
+images_np  = np.asarray(output.images.reshape(-1, H, W, C))
+images_pil = pipe.numpy_to_pil(images_np)
+
+print("Done!")
+display(images_pil[0])
