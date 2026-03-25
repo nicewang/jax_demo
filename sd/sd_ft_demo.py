@@ -269,11 +269,6 @@ if __name__ == "__main__":
     # checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=state_to_save, step=config.num_train_steps, keep=1)
     # print("Model weights successfully saved to /kaggle/working/model_naruto !")
 
-
-    # 把这两行：
-    # state_to_save = jax_utils.unreplicate(state)
-    # checkpoints.save_checkpoint(ckpt_dir="/kaggle/working/model_naruto", target=state_to_save, step=config.num_train_steps, keep=1)
-
     from flax.training import checkpoints
     from flax import jax_utils
 
