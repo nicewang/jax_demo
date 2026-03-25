@@ -14,6 +14,7 @@ from transformers import CLIPTokenizer, FlaxCLIPTextModel
 from datasets import load_dataset
 from huggingface_hub import login
 import argparse
+import json
 
 def get_hf_token():
     """Attempts to read the Hugging Face token from Kaggle Secrets, then local properties."""
@@ -243,6 +244,9 @@ if __name__ == "__main__":
     num_batches = len(train_latents) // config.batch_size
     batch_size_per_device = config.batch_size // num_devices
     
+    # NEW: Initialize a dictionary to keep track of algorithm metrics
+    history = {'step': [], 'loss': []}
+    
     for step in range(config.num_train_steps):
         rng, step_rng = jax.random.split(rng, 2)
         step_rngs = jax.random.split(step_rng, num_devices)
@@ -259,8 +263,13 @@ if __name__ == "__main__":
         
         state, loss = train_step(state, b_latents, b_embeddings, step_rngs)
         
+        # NEW: Extract scalar loss and record to history
+        loss_val = float(jax.device_get(loss[0]))
+        history['step'].append(step)
+        history['loss'].append(loss_val)
+        
         if step % 10 == 0 or step == config.num_train_steps - 1:
-            print(f"Step {step:04d} | Loss: {jax.device_get(loss[0]):.4f}")
+            print(f"Step {step:04d} | Loss: {loss_val:.4f}")
 
     print("Training finished successfully!")
     
@@ -290,3 +299,9 @@ if __name__ == "__main__":
         overwrite=True,
     )
     print("Model weights successfully saved to /kaggle/working/model_naruto !")
+    
+    # Save the recorded history metrics to disk
+    os.makedirs("/kaggle/working", exist_ok=True)
+    with open("/kaggle/working/training_metrics.json", "w") as f:
+        json.dump(history, f, indent=4)
+    print("Metrics successfully saved to /kaggle/working/training_metrics.json")
