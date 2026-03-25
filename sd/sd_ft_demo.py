@@ -58,14 +58,10 @@ class TrainConfig:
     
     # On Kaggle TPU v5e-8, there are 8 cores. Batch size must be divisible by device count.
     batch_size = 8 
-    learning_rate = 1e-4
-    num_train_steps = 50 # 50 steps is enough to see the loss drop for a sanity check
+    learning_rate = 1e-5 
+    num_epochs = 60 
     seed = 42
     
-    # Using 8 samples instead of 5 because we have 8 TPU cores. 
-    # Data size must be divisible by the global batch size (8).
-    num_samples_to_test = 8 
-
 config = TrainConfig()
 
 # Automatically login to Hugging Face if a token is provided
@@ -78,7 +74,7 @@ else:
 # ==========================================
 # 2. Load Real Dataset (Naruto)
 # ==========================================
-def load_real_dataset(dataset_name, num_samples, hf_token=None):
+def load_real_dataset(dataset_name, batch_size, hf_token=None):
     """
     Downloads the image dataset from Hugging Face and extracts a small subset for testing.
     """
@@ -86,11 +82,11 @@ def load_real_dataset(dataset_name, num_samples, hf_token=None):
     # Load the training split (pass token explicitly to avoid gated dataset errors)
     dataset = load_dataset(dataset_name, split="train", token=hf_token)
     
-    # Select only the first 'num_samples' for our quick test
-    dataset = dataset.select(range(num_samples))
+    max_samples = (len(dataset) // batch_size) * batch_size
+    dataset = dataset.select(range(max_samples))
     
     processed_dataset = []
-    print(f"Processing {num_samples} images (Resizing to 512x512 and converting to RGB)...")
+    print(f"Processing {max_samples} images (Resizing to 512x512 and converting to RGB)...")
     
     for i, item in enumerate(dataset):
         # The dataset provides a PIL Image in the "image" column and text in "text"
@@ -235,7 +231,7 @@ def train_step(state, batch_latents, batch_embeddings, train_rng):
 # ==========================================
 if __name__ == "__main__":
     # Load Real Dataset instead of synthetic, passing the token explicitly
-    raw_dataset = load_real_dataset(config.dataset_name, config.num_samples_to_test, config.hf_token)
+    raw_dataset = load_real_dataset(config.dataset_name, config.batch_size, config.hf_token)
     train_latents, train_embeddings = prepare_dataset_features(raw_dataset, config.pretrained_model_name_or_path)
     
     print(f"Starting training loop on {num_devices} TPU cores...")
@@ -244,10 +240,14 @@ if __name__ == "__main__":
     num_batches = len(train_latents) // config.batch_size
     batch_size_per_device = config.batch_size // num_devices
     
+    total_train_steps = config.num_epochs * num_batches
+    print(f"Full dataset size: {len(train_latents)}, Batch size: {config.batch_size}")
+    print(f"Total batches per epoch: {num_batches}, Total training steps: {total_train_steps}")
+    
     # NEW: Initialize a dictionary to keep track of algorithm metrics
     history = {'step': [], 'loss': []}
     
-    for step in range(config.num_train_steps):
+    for step in range(total_train_steps):
         rng, step_rng = jax.random.split(rng, 2)
         step_rngs = jax.random.split(step_rng, num_devices)
         
@@ -268,8 +268,8 @@ if __name__ == "__main__":
         history['step'].append(step)
         history['loss'].append(loss_val)
         
-        if step % 10 == 0 or step == config.num_train_steps - 1:
-            print(f"Step {step:04d} | Loss: {loss_val:.4f}")
+        if step % 10 == 0 or step == total_train_steps - 1:
+            print(f"Step {step:04d}/{total_train_steps} | Loss: {loss_val:.4f}")
 
     print("Training finished successfully!")
     
@@ -294,7 +294,7 @@ if __name__ == "__main__":
     checkpoints.save_checkpoint(
         ckpt_dir="/kaggle/working/model_naruto",
         target={"params": unet_params_to_save},
-        step=config.num_train_steps,
+        step=total_train_steps,
         keep=1,
         overwrite=True,
     )
