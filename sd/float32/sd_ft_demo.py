@@ -271,8 +271,8 @@ if __name__ == "__main__":
         history['step'].append(step)
         history['loss'].append(loss_val)
         
-        if step % 10 == 0 or step == config.num_train_steps - 1:
-            print(f"Step {step:04d} | Loss: {loss_val:.4f}")
+        if step % 10 == 0 or step == total_train_steps - 1:
+            print(f"Step {step:04d}/{total_train_steps} | Loss: {loss_val:.4f}")
 
     print("Training finished successfully!")
     
@@ -297,7 +297,7 @@ if __name__ == "__main__":
     checkpoints.save_checkpoint(
         ckpt_dir="/kaggle/working/model_naruto_float32",
         target={"params": unet_params_to_save},
-        step=config.num_train_steps,
+        step=total_train_steps,
         keep=1,
         overwrite=True,
     )
