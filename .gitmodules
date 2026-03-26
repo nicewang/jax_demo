@@ -1,6 +1,3 @@
 [submodule "sd/model_naruto"]
 	path = sd/model_naruto
 	url = https://huggingface.co/NiceWang/sd-naruto-tpu
-[submodule "sd/float32/model_naruto_weights"]
-	path = sd/float32/model_naruto_weights
-	url = https://huggingface.co/NiceWang/sd-naruto-tpu-float32
