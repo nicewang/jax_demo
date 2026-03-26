@@ -58,8 +58,8 @@ class TrainConfig:
     
     # On Kaggle TPU v5e-8, there are 8 cores. Batch size must be divisible by device count.
     batch_size = 8 
-    learning_rate = 1e-4
-    num_train_steps = 50 # 50 steps is enough to see the loss drop for a sanity check
+    learning_rate = 1e-5 
+    num_epochs = 60 
     seed = 42
     
     # Using 8 samples instead of 5 because we have 8 TPU cores. 
@@ -78,19 +78,19 @@ else:
 # ==========================================
 # 2. Load Real Dataset (Naruto)
 # ==========================================
-def load_real_dataset(dataset_name, num_samples, hf_token=None):
+def load_real_dataset(dataset_name, batch_size, hf_token=None):
     """
-    Downloads the image dataset from Hugging Face and extracts a small subset for testing.
+    Downloads the image dataset from Hugging Face.
     """
     print(f"Downloading and loading '{dataset_name}' from Hugging Face...")
     # Load the training split (pass token explicitly to avoid gated dataset errors)
     dataset = load_dataset(dataset_name, split="train", token=hf_token)
     
-    # Select only the first 'num_samples' for our quick test
-    dataset = dataset.select(range(num_samples))
+    max_samples = (len(dataset) // batch_size) * batch_size
+    dataset = dataset.select(range(max_samples))
     
     processed_dataset = []
-    print(f"Processing {num_samples} images (Resizing to 512x512 and converting to RGB)...")
+    print(f"Processing {max_samples} images (Resizing to 512x512 and converting to RGB)...")
     
     for i, item in enumerate(dataset):
         # The dataset provides a PIL Image in the "image" column and text in "text"
@@ -242,11 +242,15 @@ if __name__ == "__main__":
     
     num_batches = len(train_latents) // config.batch_size
     batch_size_per_device = config.batch_size // num_devices
+
+    total_train_steps = config.num_epochs * num_batches
+    print(f"Full dataset size: {len(train_latents)}, Batch size: {config.batch_size}")
+    print(f"Total batches per epoch: {num_batches}, Total training steps: {total_train_steps}")
     
     # NEW: Initialize a dictionary to keep track of algorithm metrics
     history = {'step': [], 'loss': []}
     
-    for step in range(config.num_train_steps):
+    for step in range(total_train_steps):
         rng, step_rng = jax.random.split(rng, 2)
         step_rngs = jax.random.split(step_rng, num_devices)
         

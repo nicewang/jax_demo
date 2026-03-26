@@ -76,7 +76,7 @@ else:
 # ==========================================
 def load_real_dataset(dataset_name, batch_size, hf_token=None):
     """
-    Downloads the image dataset from Hugging Face and extracts a small subset for testing.
+    Downloads the image dataset from Hugging Face.
     """
     print(f"Downloading and loading '{dataset_name}' from Hugging Face...")
     # Load the training split (pass token explicitly to avoid gated dataset errors)
