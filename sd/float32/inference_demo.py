@@ -1,7 +1,9 @@
 import os
 
-import gc
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]   = "platform"
 
+import gc
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,13 +13,17 @@ from flax.core import freeze, unfreeze
 from flax.training import checkpoints
 from IPython.display import display
 
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]   = "platform"
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 0 — Nuke-level cleanup: Forcefully release residual JAX memory (CRITICAL!)
+# ──────────────────────────────────────────────────────────────────────────────
+print("Clearing JAX compiler caches from training phase...")
+# This forces JAX to clear all cached compiled graphs from the fine-tuning 
+# phase, freeing up precious TPU HBM for the inference compilation.
+jax.clear_caches()
+gc.collect()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Device setup — use only 1 TPU core for single-image inference.
-# Using all 8 cores would force jax_utils.replicate() to create 8 copies of
-# every parameter tensor in CPU RAM before the first tensor reaches the TPU.
 # ──────────────────────────────────────────────────────────────────────────────
 cpu_device = jax.devices("cpu")[0]
 single_tpu = jax.devices()[:1]
@@ -29,16 +35,13 @@ MODEL_ID       = "runwayml/stable-diffusion-v1-5"
 CHECKPOINT_DIR = "/kaggle/working/model_naruto_float32"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 1 — Load the base pipeline on CPU.
-#
-# dtype = float32.
-# Loading on CPU keeps everything out of TPU HBM until we explicitly move it.
+# Step 1 — Load the base pipeline on CPU in float32.
 # ──────────────────────────────────────────────────────────────────────────────
-print("Loading base pipeline on CPU…")
+print("Loading base pipeline on CPU in float32…")
 with jax.default_device(cpu_device):
     pipe, params = FlaxStableDiffusionPipeline.from_pretrained(
         MODEL_ID,
-        dtype=jnp.float32,
+        dtype=jnp.float32,  # Strictly keep float32 precision
         from_pt=True,
         safety_checker=None,
     )
@@ -54,40 +57,24 @@ with jax.default_device(cpu_device):
     del params["unet"]
     gc.collect()
 
-    # Load the checkpoint.  target=None → raw dict, no pytree shape hint needed.
+    # Load the checkpoint. target=None → raw dict
     raw_ckpt = checkpoints.restore_checkpoint(ckpt_dir=CHECKPOINT_DIR, target=None)
 
-    # No cast required — assign directly.
+    # Assign directly to perfectly preserve your float32 precision.
     params["unet"] = raw_ckpt["params"]
 
     del raw_ckpt
     gc.collect()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 3 — Verify dtypes for all components.
-# ──────────────────────────────────────────────────────────────────────────────
-print("Verifying component dtypes…")
-with jax.default_device(cpu_device):
-    for key in list(params.keys()):
-        leaves = jax.tree_util.tree_leaves(params[key])
-        if not leaves:
-            continue
-    gc.collect()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Step 4 — Move parameters to the single TPU core.
-#
-# We process one component at a time.  After each replicate() call we call
-# jax.block_until_ready() to force XLA to complete the DMA transfer before
-# we delete the CPU-side source.  Without this, the async XLA runtime may hold
-# a hidden reference and the CPU buffer will not be freed until much later.
+# Step 3 — Move parameters to the single TPU core.
 # ──────────────────────────────────────────────────────────────────────────────
 print("Replicating parameters to TPU core 0…")
 p_params = {}
 for key in list(params.keys()):
     print(f"  → {key}")
     p_params[key] = jax_utils.replicate(params[key], devices=single_tpu)
-    jax.block_until_ready(p_params[key])   # wait for transfer to finish
+    jax.block_until_ready(p_params[key])   # wait for DMA transfer to finish
     del params[key]
     gc.collect()
 
@@ -95,7 +82,7 @@ p_params = freeze(p_params)
 print("All parameters on TPU.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 5 — Run inference.
+# Step 4 — Run inference.
 # ──────────────────────────────────────────────────────────────────────────────
 PROMPT = "A drawing of Naruto Uzumaki"
 print(f"\nPrompt: '{PROMPT}'")
@@ -105,6 +92,7 @@ prompt_ids   = pipe.prepare_inputs(prompts)
 p_prompt_ids = jax_utils.replicate(prompt_ids, devices=single_tpu)
 prng_seed    = jax.random.split(jax.random.PRNGKey(42), len(single_tpu))
 
+print("Compiling and generating image (this might take a moment)...")
 output = pipe(
     prompt_ids=p_prompt_ids,
     params=p_params,
@@ -114,14 +102,7 @@ output = pipe(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 6 — Convert to PIL and display.
-#
-# output.images shape: (num_devices, batch_per_device, H, W, C)
-#                    = (1, 1, 512, 512, 3) with our single-device setup.
-#
-# block_until_ready() ensures the TPU computation is complete before we
-# initiate the device→host copy.  reshape(-1, H, W, C) collapses the
-# leading (num_devices, batch) dims so numpy_to_pil gets the expected layout.
+# Step 5 — Convert to PIL and display.
 # ──────────────────────────────────────────────────────────────────────────────
 print("Transferring result to host…")
 jax.block_until_ready(output.images)

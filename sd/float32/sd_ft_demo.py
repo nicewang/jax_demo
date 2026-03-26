@@ -1,5 +1,7 @@
 import os
 
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -13,8 +15,6 @@ from datasets import load_dataset
 from huggingface_hub import login
 import argparse
 import json
-
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 def get_hf_token():
     """Attempts to read the Hugging Face token from Kaggle Secrets, then local properties."""
