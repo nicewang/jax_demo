@@ -1,7 +1,4 @@
 import os
-# CRITICAL: Must be set before importing JAX.
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]   = "platform"
 
 import gc
 
@@ -13,6 +10,9 @@ from flax import jax_utils
 from flax.core import freeze, unfreeze
 from flax.training import checkpoints
 from IPython.display import display
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]   = "platform"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Device setup — use only 1 TPU core for single-image inference.
