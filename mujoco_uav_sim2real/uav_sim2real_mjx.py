@@ -19,7 +19,7 @@ import time
 # ==========================================
 # 1. Hugging Face Dataset Integration 
 # ==========================================
-def load_hf_trajectory_dataset(num_points=10): # Reduced to 10 points for a quick demo
+def load_hf_trajectory_dataset(num_points=10, hf_token=None):
     """
     Load real-world UAV flight trajectory data from Hugging Face Hub.
     Using open-source dataset: riotu-lab/Synthetic-UAV-Flight-Trajectories
@@ -27,7 +27,8 @@ def load_hf_trajectory_dataset(num_points=10): # Reduced to 10 points for a quic
     print(f"Downloading {num_points} waypoints from Hugging Face...")
     
     try:
-        dataset = load_dataset("riotu-lab/Synthetic-UAV-Flight-Trajectories", split="train")
+        # Pass the token here to authenticate and bypass IP rate limits
+        dataset = load_dataset("riotu-lab/Synthetic-UAV-Flight-Trajectories", split="train", token=hf_token)
         subset = dataset.select(range(num_points))
         
         if 'x' in subset.column_names and 'y' in subset.column_names and 'z' in subset.column_names:
@@ -111,9 +112,14 @@ class UAVTrackingEnv(Env):
         data = mjx.forward(self.sys_mjx, data)
         obs = self._get_obs(data, target_idx=0)
         
+        # Calculate initial distance
+        uav_pos = data.qpos[:3]
+        target_pos = self.waypoints[0]
+        initial_distance = jnp.linalg.norm(uav_pos - target_pos)
+        
         return State(
             pipeline_state=data, obs=obs, reward=jnp.array(0.0), done=jnp.array(0.0),
-            metrics={"target_idx": jnp.array(0), "distance_to_target": jnp.array(0.0)}
+            metrics={"target_idx": jnp.array(0), "distance_to_target": initial_distance}
         )
 
     def step(self, state: State, action: jnp.ndarray) -> State:
@@ -136,7 +142,10 @@ class UAVTrackingEnv(Env):
         done = jnp.where(distance > 5.0, 1.0, done)
         
         obs = self._get_obs(data, target_idx)
-        metrics = {"target_idx": target_idx, "distance_to_target": distance}
+        
+        metrics = state.metrics.copy()
+        metrics["target_idx"] = target_idx
+        metrics["distance_to_target"] = distance
         
         return state.replace(pipeline_state=data, obs=obs, reward=reward, done=done, metrics=metrics)
 
@@ -144,6 +153,10 @@ class UAVTrackingEnv(Env):
         uav_pos, uav_quat, uav_vel = data.qpos[:3], data.qpos[3:7], data.qvel[:3]
         target_pos = self.waypoints[target_idx]
         return jnp.concatenate([uav_pos, uav_quat, uav_vel, target_pos])
+
+    @property
+    def backend(self) -> str:
+        return "mjx"
 
     @property
     def action_size(self): return 4
@@ -156,10 +169,22 @@ class UAVTrackingEnv(Env):
 def main():
     print(f"JAX Devices: {jax.device_count()} (TPU cores expected: 8 on Kaggle)")
     
+    # --- GET HUGGING FACE TOKEN ---
+    hf_token = None
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        hf_token = user_secrets.get_secret("HF_TOKEN_WRITE")
+        print("Successfully retrieved HF_TOKEN_WRITE from Kaggle Secrets!")
+    except ImportError:
+        print("Not running in Kaggle environment (kaggle_secrets not found). Proceeding without token.")
+    except Exception as e:
+        print(f"Failed to retrieve HF token from Kaggle Secrets: {e}")
+        
     # --- PHASE 1: PREPARE ENV ---
-    waypoints = load_hf_trajectory_dataset(num_points=10) # 10 points for quick demo
+    # Pass the retrieved token to the dataset loading function
+    waypoints = load_hf_trajectory_dataset(num_points=8, hf_token=hf_token) # 10 points for quick demo
     env = UAVTrackingEnv(waypoints)
-    env_fn = lambda: env
     
     # --- PHASE 2: TRAINING ---
     print("\n--- Starting PPO Training ---")
@@ -167,9 +192,9 @@ def main():
     
     # Reduced num_timesteps to 100,000 so it finishes in a few minutes on Kaggle
     make_inference_fn, params, _ = ppo.train(
-        environment=env_fn,
+        environment=env,
         num_timesteps=100_000,   
-        num_evals=8,
+        num_evals=5,
         reward_scaling=1.0,
         episode_length=200,      
         normalize_observations=True,
