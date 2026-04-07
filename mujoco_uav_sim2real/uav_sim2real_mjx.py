@@ -31,15 +31,31 @@ def load_hf_trajectory_dataset(num_points=10, hf_token=None):
         dataset = load_dataset("riotu-lab/Synthetic-UAV-Flight-Trajectories", split="train", token=hf_token)
         subset = dataset.select(range(num_points))
         
-        if 'x' in subset.column_names and 'y' in subset.column_names and 'z' in subset.column_names:
+        cols = subset.column_names
+        print(f"Detected columns in dataset: {cols}")
+        
+        # 1. Exact match (Standard)
+        if 'x' in cols and 'y' in cols and 'z' in cols:
             waypoints = np.column_stack((subset['x'], subset['y'], subset['z']))
-        elif 'position' in subset.column_names:
+            
+        # 2. String/Array column match
+        elif 'position' in cols:
             positions = subset['position']
             if isinstance(positions[0], str):
                 positions = [ast.literal_eval(p) for p in positions]
             waypoints = np.array(positions)
+            
+        # 3. Dynamic match (handles ROS/Gazebo CSV exports like 'field.pose.position.x')
         else:
-            raise ValueError("Columns not recognized")
+            x_col = next((c for c in cols if c.lower() == 'x' or c.lower().endswith('.x') or c.lower().endswith('_x')), None)
+            y_col = next((c for c in cols if c.lower() == 'y' or c.lower().endswith('.y') or c.lower().endswith('_y')), None)
+            z_col = next((c for c in cols if c.lower() == 'z' or c.lower().endswith('.z') or c.lower().endswith('_z')), None)
+            
+            if x_col and y_col and z_col:
+                print(f"Dynamically matched columns: X='{x_col}', Y='{y_col}', Z='{z_col}'")
+                waypoints = np.column_stack((subset[x_col], subset[y_col], subset[z_col]))
+            else:
+                raise ValueError(f"Columns not recognized. Available columns were: {cols}")
             
         print(f"Successfully loaded {len(waypoints)} waypoints!")
         
