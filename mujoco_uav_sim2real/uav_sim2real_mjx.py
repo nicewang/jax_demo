@@ -10,32 +10,56 @@ from mujoco import mjx
 from brax import envs
 from brax.envs.base import State, Env
 from brax.training.agents.ppo import train as ppo
-from datasets import Dataset
+from datasets import load_dataset, Dataset
 import numpy as np
+import ast
 
 # ==========================================
 # 1. Hugging Face Dataset Integration (Load Target Trajectory)
 # ==========================================
-def load_hf_trajectory_dataset():
+def load_hf_trajectory_dataset(num_points=500):
     """
-    Simulate loading real-world UAV flight trajectory data from Hugging Face.
-    In practice, you can use: dataset = load_dataset("your-org/uav-real-trajectories")
-    Here we use a dict to generate a demo Dataset, representing the waypoints the UAV needs to track.
+    Load real-world UAV flight trajectory data from Hugging Face Hub.
+    Using open-source dataset: riotu-lab/Synthetic-UAV-Flight-Trajectories
     """
-    print("Loading UAV trajectory dataset from Hugging Face...")
-    data = {
-        "target_x": [1.0, 2.0, 2.0, 0.0],
-        "target_y": [0.0, 1.0, -1.0, 0.0],
-        "target_z": [2.0, 2.5, 2.0, 1.5],
-    }
-    dataset = Dataset.from_dict(data)
-    # Convert the dataset to a JAX array for fast reading on TPU
-    waypoints = jnp.array([
-        dataset["target_x"],
-        dataset["target_y"],
-        dataset["target_z"]
-    ]).T
-    return waypoints
+    print("Downloading open-source UAV trajectory dataset from Hugging Face...")
+    print("Dataset: riotu-lab/Synthetic-UAV-Flight-Trajectories")
+    
+    try:
+        # Load the actual dataset from Hugging Face
+        # This dataset contains ~766k rows of UAV trajectories
+        dataset = load_dataset("riotu-lab/Synthetic-UAV-Flight-Trajectories", split="train")
+        
+        # Select a contiguous trajectory sequence (e.g., first 500 waypoints)
+        subset = dataset.select(range(num_points))
+        
+        # Parse the dataset format safely handling potential column variations
+        if 'x' in subset.column_names and 'y' in subset.column_names and 'z' in subset.column_names:
+            waypoints = np.column_stack((subset['x'], subset['y'], subset['z']))
+        elif 'position' in subset.column_names:
+            positions = subset['position']
+            # Safely parse if positions are stored as strings (e.g., "[1.0, 2.0, 3.0]")
+            if isinstance(positions[0], str):
+                positions = [ast.literal_eval(p) for p in positions]
+            waypoints = np.array(positions)
+        else:
+            # Fallback for unexpected column structures
+            print(f"Unexpected columns: {subset.column_names}. Falling back to demo data.")
+            raise ValueError("Columns not recognized")
+            
+        print(f"Successfully loaded {len(waypoints)} waypoints from Hugging Face!")
+        
+    except Exception as e:
+        print(f"Could not load HF dataset online ({e}). Using local fallback trajectory...")
+        waypoints = np.array([
+            [1.0, 0.0, 2.0],
+            [2.0, 1.0, 2.5],
+            [2.0, -1.0, 2.0],
+            [0.0, 0.0, 1.5]
+        ])
+
+    # Convert the dataset to a JAX array for fast memory access on TPU
+    return jnp.array(waypoints)
 
 # ==========================================
 # 2. MuJoCo UAV (Quadrotor) Model Definition (XML)
