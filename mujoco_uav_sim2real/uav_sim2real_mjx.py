@@ -1,5 +1,5 @@
 """
-UAV Sim2Real Training Demo with MuJoCo XLA (MJX), JAX, Brax, and Hugging Face.
+UAV Sim2Real Training Demo with MuJoCo XLA (MJX), JAX, Brax using OpenSource Dataset from Hugging Face.
 Optimized drone reinforcement learning training script for TPU v5e-8 / Kaggle TPU v3-8.
 """
 
@@ -169,7 +169,7 @@ def main():
     make_inference_fn, params, _ = ppo.train(
         environment=env_fn,
         num_timesteps=100_000,   
-        num_evals=5,
+        num_evals=8,
         reward_scaling=1.0,
         episode_length=200,      
         normalize_observations=True,
@@ -191,7 +191,6 @@ def main():
     model_path = "uav_ppo_policy.pkl"
     brax_model.save(params, model_path)
     print(f"Model successfully saved to '{model_path}'.")
-    # You can download this file from the Kaggle right-hand "Output" panel
 
     # --- PHASE 4: INFERENCE (TESTING THE LOADED MODEL) ---
     print("\n--- Running Inference with Saved Model ---")
