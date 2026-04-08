@@ -3,29 +3,34 @@ UAV Sim2Real Training Demo with MuJoCo XLA (MJX), JAX, Brax using OpenSource Dat
 Optimized drone reinforcement learning training script for TPU v5e-8 / Kaggle TPU v3-8.
 """
 
+import os
+# Must be set BEFORE importing JAX
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+# ADD: Disable pmap-based multi-device compilation; Brax 0.14 uses sharding instead
+os.environ["BRAX_DISABLE_PMAP"] = "1"
+
 import jax
 from jax import numpy as jnp
+# ADD: Import sharding utilities for TPU v5e mesh-based execution
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+from jax.experimental import mesh_utils
 import mujoco
 from mujoco import mjx
-from brax import envs
-from brax.envs.base import State, Env
+
+# ADD: Use PipelineEnv instead of bare Env — required by Brax 0.14.x PPO trainer
+from brax.envs.base import State, PipelineEnv
+from brax.io import mjcf as brax_mjcf    # ADD: Brax 0.14 uses mjcf loader
 from brax.training.agents.ppo import train as ppo
-from brax.io import model as brax_model  # For saving and loading models
+from brax.io import model as brax_model
 
 import pandas as pd
 import numpy as np
 import ast
 import time
-import os
-import gc  # Added for forced garbage collection
-
-# Restrict JAX from pre-allocating all memory to mitigate Out-Of-Memory (OOM) issues
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Forces JAX to use the system memory allocator
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"  # ADD: Prevent over-parallelism during compilation
-
+import gc
 import glob
-from huggingface_hub import HfApi, snapshot_download  # The ultimate solution for massive file repositories
+from huggingface_hub import HfApi, snapshot_download
 
 # ==========================================
 # 1. Data Processing and Batch Loading Logic
@@ -34,30 +39,22 @@ def parse_dataframe(df, num_points):
     """Helper function: Parse coordinate points from DataFrames with different structures"""
     df = df.head(num_points)
     cols = df.columns.tolist()
-    
-    # 1. Exact match for standard coordinates
+
     if 'x' in cols and 'y' in cols and 'z' in cols:
         return np.column_stack((df['x'], df['y'], df['z']))
-        
-    # 2. Exact match for translation coordinates (tx, ty, tz)
     elif 'tx' in cols and 'ty' in cols and 'tz' in cols:
         return np.column_stack((df['tx'], df['ty'], df['tz']))
-        
-    # 3. String/Array column match
     elif 'position' in cols:
         positions = df['position'].tolist()
         if isinstance(positions[0], str):
             positions = [ast.literal_eval(p) for p in positions]
         return np.array(positions)
-        
-    # 4. Dynamic match for complex/nested names (handles .x, _x, tx, etc.)
     else:
         x_col = next((c for c in cols if c.lower() in ['x', 'tx'] or c.lower().endswith('.x') or c.lower().endswith('_x')), None)
         y_col = next((c for c in cols if c.lower() in ['y', 'ty'] or c.lower().endswith('.y') or c.lower().endswith('_y')), None)
         z_col = next((c for c in cols if c.lower() in ['z', 'tz'] or c.lower().endswith('.z') or c.lower().endswith('_z')), None)
-        
         if x_col and y_col and z_col:
-            return np.column_stack((df[x_col], df[y_col], df[z_col]))
+            return np.column_stack[(df[x_col], df[y_col], df[z_col])]
         else:
             raise ValueError(f"Unrecognized column names. Available columns are: {cols}")
 
@@ -67,11 +64,9 @@ def get_csv_file_lists(repo_id, hf_token=None):
     api = HfApi(token=hf_token)
     all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
     csv_files = [f for f in all_files if f.endswith('.csv')]
-    
     mid_point = len(csv_files) // 2
     batch1 = csv_files[:mid_point]
     batch2 = csv_files[mid_point:]
-    
     print(f"Discovered a total of {len(csv_files)} CSV files.")
     print(f"Split into two batches: Batch 1 ({len(batch1)} files), Batch 2 ({len(batch2)} files).")
     return batch1, batch2
@@ -81,7 +76,6 @@ def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_point
     Download specified batch of files (multi-threaded), and extract a certain number of waypoints for Demo training.
     """
     print(f"\nStarting batch download ({len(file_list)} files in total)...")
-    # snapshot_download will fast-download files specified in allow_patterns using multiple threads
     local_dir = snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
@@ -89,31 +83,25 @@ def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_point
         token=hf_token,
         max_workers=8
     )
-    
-    # Get the list of locally downloaded CSV files
     local_csvs = glob.glob(os.path.join(local_dir, "**/*.csv"), recursive=True)
-    local_csvs.sort()  # Sort to ensure consistency in extraction
-    
+    local_csvs.sort()
     if not local_csvs:
         raise FileNotFoundError("Could not find downloaded CSV files locally!")
-        
     print(f"Batch download complete! {len(local_csvs)} related files exist locally.")
     print(f"Extracting {num_demo_points} trajectory points from the first file ({os.path.basename(local_csvs[0])})...")
-    
     df = pd.read_csv(local_csvs[0])
     waypoints = parse_dataframe(df, num_points=num_demo_points)
-    
     print(f"Successfully extracted {len(waypoints)} waypoints!")
-    return jnp.array(waypoints)
+    return jnp.array(waypoints, dtype=jnp.float32)
 
 # ==========================================
 # 2. MuJoCo UAV (Quadrotor) Model Definition (XML)
 # ==========================================
 UAV_XML = """
 <mujoco model="quadrotor">
-  <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
+  <compiler angle="degree" inertiafromgeom="true"/>
   <option gravity="0 0 -9.81" timestep="0.01" integrator="RK4"/>
-  
+
   <default>
     <geom friction="1 0.1 0.1" margin="0.001" rgba="0.8 0.6 0.4 1"/>
     <joint damping="0.01"/>
@@ -122,7 +110,7 @@ UAV_XML = """
   <worldbody>
     <light pos="0 0 10" dir="0 0 -1" diffuse="1 1 1"/>
     <geom type="plane" size="10 10 0.1" rgba="0.9 0.9 0.9 1"/>
-    
+
     <!-- UAV Body -->
     <body name="uav" pos="0 0 1">
       <freejoint name="root"/>
@@ -144,83 +132,88 @@ UAV_XML = """
 """
 
 # ==========================================
-# 3. Brax/MJX Reinforcement Learning Environment
+# 3. Brax/MJX RL Environment
+# FIX: Inherit from PipelineEnv (required by Brax 0.14.x PPO trainer)
+#      instead of bare Env which causes incorrect pmap code path
 # ==========================================
-class UAVTrackingEnv(Env):
+class UAVTrackingEnv(PipelineEnv):
     def __init__(self, waypoints):
-        super().__init__()
-        self.sys = mujoco.MjModel.from_xml_string(UAV_XML)
-        self.sys_mjx = mjx.put_model(self.sys)
+        # FIX: Load sys via brax mjcf pipeline, required for PipelineEnv
+        sys = brax_mjcf.loads(UAV_XML)
+        # FIX: n_frames=1 and backend='mjx' routes computation to MJX on TPU
+        super().__init__(sys=sys, backend='mjx', n_frames=1)
         self.waypoints = waypoints
         self.num_waypoints = waypoints.shape[0]
 
     def reset(self, rng: jnp.ndarray) -> State:
         rng, rng_state = jax.random.split(rng)
-        data = mjx.make_data(self.sys_mjx)
-        
-        # Initial pose random perturbation
-        qpos = self.sys_mjx.qpos0 + jax.random.uniform(rng_state, (self.sys.nq,), minval=-0.1, maxval=0.1)
-        data = data.replace(qpos=qpos)
-        
-        data = mjx.forward(self.sys_mjx, data)
-        obs = self._get_obs(data, target_idx=0)
-        
-        uav_pos = data.qpos[:3]
+        # FIX: Use self.pipeline_init() instead of mjx.make_data() directly
+        pipeline_state = self.pipeline_init(
+            self.sys.init_q + jax.random.uniform(rng_state, (self.sys.q_size(),), minval=-0.1, maxval=0.1),
+            jnp.zeros(self.sys.qd_size())
+        )
+        obs = self._get_obs(pipeline_state, target_idx=jnp.array(0))
+        uav_pos = pipeline_state.q[:3]
         target_pos = self.waypoints[0]
         initial_distance = jnp.linalg.norm(uav_pos - target_pos)
-        
         return State(
-            pipeline_state=data, obs=obs, reward=jnp.array(0.0), done=jnp.array(0.0),
-            metrics={"target_idx": jnp.array(0), "distance_to_target": initial_distance}
+            pipeline_state=pipeline_state,
+            obs=obs,
+            reward=jnp.array(0.0),
+            done=jnp.array(0.0),
+            metrics={"target_idx": jnp.array(0.0), "distance_to_target": initial_distance}
         )
 
     def step(self, state: State, action: jnp.ndarray) -> State:
-        data = state.pipeline_state
-        target_idx = state.metrics["target_idx"]
-        
-        data = data.replace(ctrl=action)
-        data = mjx.step(self.sys_mjx, data)
-        
-        uav_pos = data.qpos[:3]
+        # FIX: Use self.pipeline_step() instead of mjx.step() directly
+        pipeline_state = self.pipeline_step(state.pipeline_state, action)
+        target_idx = state.metrics["target_idx"].astype(jnp.int32)
+
+        uav_pos = pipeline_state.q[:3]
         target_pos = self.waypoints[target_idx]
         distance = jnp.linalg.norm(uav_pos - target_pos)
-        
+
         reward = -distance
-        
+
         reached = distance < 0.2
-        target_idx = jnp.where(reached, jnp.minimum(target_idx + 1, self.num_waypoints - 1), target_idx)
-        
+        next_idx = jnp.minimum(target_idx + 1, self.num_waypoints - 1)
+        target_idx = jnp.where(reached, next_idx, target_idx).astype(jnp.float32)
+
         done = jnp.where(uav_pos[2] < 0.1, 1.0, 0.0)
         done = jnp.where(distance > 5.0, 1.0, done)
+
+        obs = self._get_obs(pipeline_state, target_idx.astype(jnp.int32))
         
-        obs = self._get_obs(data, target_idx)
-        
+        # FIX: Must copy existing metrics to preserve keys (like 'reward') added by Brax wrappers
         metrics = state.metrics.copy()
         metrics["target_idx"] = target_idx
         metrics["distance_to_target"] = distance
         
-        return state.replace(pipeline_state=data, obs=obs, reward=reward, done=done, metrics=metrics)
+        return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward, done=done, metrics=metrics)
 
-    def _get_obs(self, data: mjx.Data, target_idx: int) -> jnp.ndarray:
-        uav_pos, uav_quat, uav_vel = data.qpos[:3], data.qpos[3:7], data.qvel[:3]
+    def _get_obs(self, pipeline_state, target_idx) -> jnp.ndarray:
+        uav_pos  = pipeline_state.q[:3]
+        uav_quat = pipeline_state.q[3:7]
+        uav_vel  = pipeline_state.qd[:3]
         target_pos = self.waypoints[target_idx]
         return jnp.concatenate([uav_pos, uav_quat, uav_vel, target_pos])
 
     @property
-    def backend(self) -> str:
-        return "mjx"
-
+    def action_size(self) -> int: return 4
     @property
-    def action_size(self): return 4
-    @property
-    def observation_size(self): return 13
+    def observation_size(self) -> int: return 13
 
 # ==========================================
-# 4. Main Flow: Batch Download -> Interval Training -> Forced CD -> Continual Training
+# 4. Main Flow
 # ==========================================
 def main():
-    print(f"JAX Hardware Devices: {jax.device_count()} (Should be 8 TPU cores on Kaggle)")
-    
+    # ADD: Build a 1D mesh across all 8 TPU cores for sharding-based PPO
+    # This replaces pmap and correctly distributes num_envs across devices
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    mesh = Mesh(devices, axis_names=('batch',))
+    print(f"JAX Hardware Devices: {jax.device_count()} TPU cores")
+    print(f"Mesh created: {mesh}")
+
     # --- GET HUGGING FACE TOKEN ---
     hf_token = None
     try:
@@ -230,137 +223,127 @@ def main():
         print("Successfully retrieved HF_TOKEN_WRITE from Kaggle Secrets!")
     except Exception:
         print("Kaggle Secrets not detected, attempting in anonymous mode.")
-        
+
     REPO_ID = "riotu-lab/Synthetic-UAV-Flight-Trajectories"
-    
-    # Get two batches of file lists
+
     batch1_files, batch2_files = get_csv_file_lists(REPO_ID, hf_token)
-    
-    # Record the start time of the first batch download + training
     stage1_start_time = time.time()
-    
-    # --- STAGE 1: Download Batch 1, extract 4 tracks and train ---
+
+    # --- STAGE 1 ---
     print("\n[STAGE 1] ---------------------------------------------")
     waypoints_batch1 = download_batch_and_extract_demo(REPO_ID, batch1_files, hf_token, num_demo_points=4)
-    
+
     print("\nStarting Stage 1 PPO training (Based on Batch 1 data)...")
     env_1 = UAVTrackingEnv(waypoints_batch1)
-    
-    # Force Garbage Collection before heavy XLA compilation
     gc.collect()
-    
-    # EXTREME MEMORY SAVING MODE:
-    # Ensuring that num_envs * unroll_length is divisible by num_minibatches (32*5=160, 160/4=40 ✓)
-    make_inference_fn_1, params_1, _ = ppo.train(
-        environment=env_1,
-        num_timesteps=10_000,    # REDUCED: 20k -> 10k to shrink compilation graph
-        num_evals=2,             # REDUCED: 5 -> 2, fewer evals means fewer recompilations
-        reward_scaling=1.0,
-        episode_length=50,       # REDUCED: 100 -> 50, biggest single graph-size driver
-        normalize_observations=True,
-        action_repeat=1,
-        unroll_length=5,         # REDUCED: 10 -> 5
-        num_minibatches=4,       # REDUCED: rebalanced (32*5=160, 160/4=40 ✓)
-        num_updates_per_batch=2, # REDUCED: 4 -> 2, less inner-loop unrolling during compilation
-        discounting=0.99,
-        learning_rate=3e-4,
-        entropy_cost=1e-3,
-        num_envs=32,             # REDUCED: 64 -> 32, single biggest host RAM saver
-        batch_size=32,           # REDUCED: must match num_envs
-        seed=42,
-    )
+
+    # ADD: Wrap ppo.train inside the mesh context so sharding replaces pmap
+    # num_envs must be divisible by device count (8): 8*n
+    # Balance: num_envs(64) * unroll_length(10) / num_minibatches(8) = 80 per minibatch ✓
+    with mesh:
+        make_inference_fn_1, params_1, _ = ppo.train(
+            environment=env_1,
+            num_timesteps=20_000,
+            num_evals=2,
+            reward_scaling=1.0,
+            episode_length=50,
+            normalize_observations=True,
+            action_repeat=1,
+            unroll_length=10,
+            num_minibatches=8,       # FIX: Must equal device count (8) for correct sharding
+            num_updates_per_batch=2,
+            discounting=0.99,
+            learning_rate=3e-4,
+            entropy_cost=1e-3,
+            num_envs=64,             # FIX: Must be divisible by 8 (device count)
+            batch_size=64,
+            seed=42,
+        )
     print("Stage 1 training completed successfully.")
 
-    # --- Force JAX compilation cache eviction before Stage 2 ---
-    # ADD: Without this, Stage 1 and Stage 2 compiled graphs coexist in RAM causing OOM
+    # --- Memory Cleanup between stages ---
     print("\n[Memory Cleanup] Clearing JAX compilation cache...")
-    jax.clear_caches()  # ADD: Evicts all XLA compiled function cache from host RAM
-    del env_1           # ADD: Release Stage 1 env reference to free associated memory
+    jax.clear_caches()
+    del env_1
     gc.collect()
     print("Cache cleared.")
 
-    # --- Forced Cooldown (CD): Ensure 5 minutes (300 seconds) have passed since Batch 1 download ---
+    # --- Forced Cooldown ---
     print("\n[API Protection Mechanism] ------------------------------------------")
     elapsed_time = time.time() - stage1_start_time
-    wait_target = 310  # Wait 310 seconds to safely pass the 5-minute limit
-    
+    wait_target = 310
     if elapsed_time < wait_target:
         sleep_duration = wait_target - elapsed_time
-        print(f"Only {elapsed_time:.1f} seconds have passed since the first API request.")
-        print(f"To prevent triggering Hugging Face's 5000 requests/5 min limit, the program will sleep for {sleep_duration:.1f} seconds...")
+        print(f"Only {elapsed_time:.1f}s elapsed. Sleeping {sleep_duration:.1f}s to reset HF API quota...")
         time.sleep(sleep_duration)
         print("Wait over! API quota has been reset.")
     else:
-        print(f"Stage 1 took {elapsed_time:.1f} seconds, safely exceeding the 5-minute limit. Continuing directly!")
+        print(f"Stage 1 took {elapsed_time:.1f}s, safely exceeding the 5-minute limit. Continuing directly!")
 
-    # --- STAGE 2: Download Batch 2, extract 4 tracks and continual train ---
+    # --- STAGE 2 ---
     print("\n[STAGE 2] ---------------------------------------------")
     waypoints_batch2 = download_batch_and_extract_demo(REPO_ID, batch2_files, hf_token, num_demo_points=4)
-    
+
     print("\nStarting Stage 2 Continual Learning...")
     env_2 = UAVTrackingEnv(waypoints_batch2)
-    
-    # Force Garbage Collection before the second compilation
     gc.collect()
-    
-    # CORE: Pass restore_params=params_1 to inherit memories from Stage 1
-    # Keep all params identical to Stage 1 to reuse the cached XLA compilation
-    make_inference_fn_2, params_2, _ = ppo.train(
-        environment=env_2,
-        num_timesteps=10_000,    # REDUCED: matched to Stage 1
-        num_evals=2,             # REDUCED: matched to Stage 1
-        restore_params=params_1, # <--- Inherit old weights here
-        reward_scaling=1.0,
-        episode_length=50,       # REDUCED: matched to Stage 1
-        normalize_observations=True,
-        action_repeat=1,
-        unroll_length=5,         # REDUCED: matched to Stage 1
-        num_minibatches=4,       # REDUCED: matched to Stage 1
-        num_updates_per_batch=2, # REDUCED: matched to Stage 1
-        discounting=0.99,
-        learning_rate=3e-4,
-        entropy_cost=1e-3,
-        num_envs=32,             # REDUCED: matched to Stage 1
-        batch_size=32,           # REDUCED: matched to Stage 1
-        seed=99,
-    )
+
+    with mesh:
+        make_inference_fn_2, params_2, _ = ppo.train(
+            environment=env_2,
+            num_timesteps=20_000,
+            num_evals=2,
+            restore_params=params_1,  # <--- Inherit weights from Stage 1
+            reward_scaling=1.0,
+            episode_length=50,
+            normalize_observations=True,
+            action_repeat=1,
+            unroll_length=10,
+            num_minibatches=8,       # FIX: Matched to Stage 1
+            num_updates_per_batch=2,
+            discounting=0.99,
+            learning_rate=3e-4,
+            entropy_cost=1e-3,
+            num_envs=64,
+            batch_size=64,
+            seed=99,
+        )
     print("Stage 2 continual training completed.")
 
-    # --- STAGE 3: Save the final continual learning model ---
+    # --- STAGE 3: Save model ---
     print("\n[Wrap Up] ---------------------------------------------")
     model_path = "uav_continual_ppo_policy.pkl"
     brax_model.save(params_2, model_path)
-    print(f"The final continual training model has been saved to: '{model_path}'")
+    print(f"Final model saved to: '{model_path}'")
 
-    # --- STAGE 4: Flight test (Inference) on Batch 2 waypoints ---
+    # --- STAGE 4: Inference ---
     print("\nStarting UAV flight test on Batch 2 trajectories...")
     loaded_params = brax_model.load(model_path)
     policy_fn = make_inference_fn_2(loaded_params)
-    
-    jit_reset = jax.jit(env_2.reset)
-    jit_step = jax.jit(env_2.step)
+
+    jit_reset  = jax.jit(env_2.reset)
+    jit_step   = jax.jit(env_2.step)
     jit_policy = jax.jit(policy_fn)
-    
+
     rng = jax.random.PRNGKey(123)
     rng, rng_reset = jax.random.split(rng)
-    
     state = jit_reset(rng_reset)
     print("UAV Takeoff!")
-    
+
     for step in range(100):
         rng, rng_act = jax.random.split(rng)
         ctrl, _ = jit_policy(state.obs, rng_act)
         state = jit_step(state, ctrl)
-        
+
         if step % 10 == 0:
             dist = state.metrics['distance_to_target']
             target_idx = state.metrics['target_idx']
-            print(f"Time Step {step:03d} | Tracking Waypoint {target_idx} | Distance Error: {dist:.3f} m")
-            
+            print(f"Time Step {step:03d} | Tracking Waypoint {int(target_idx)} | Distance Error: {dist:.3f} m")
+
         if state.done:
             print(f"UAV crashed or flew out of bounds. Episode terminated early at step {step}.")
             break
-            
+
     print("All processes demonstrated successfully!")
 
 if __name__ == "__main__":
