@@ -25,6 +25,7 @@ from brax.envs.base import State, PipelineEnv
 from brax.io import mjcf as brax_mjcf
 from brax.training.agents.ppo import train as ppo
 from brax.io import model as brax_model
+from brax.io import html
 
 import pandas as pd
 import numpy as np
@@ -147,8 +148,15 @@ class UAVTrackingEnv(PipelineEnv):
 
     def reset(self, rng: jnp.ndarray) -> State:
         rng, rng_state = jax.random.split(rng)
+        
+        # FIX: Spawn UAV near the first waypoint instead of (0,0,1)
+        target_pos = self.waypoints[0]
+        # 1.0m to Z axis to ensure it spawns safely above ground
+        init_pos = target_pos + jnp.array([0.0, 0.0, 1.0])
+        init_q = self.sys.init_q.at[:3].set(init_pos)
+        
         pipeline_state = self.pipeline_init(
-            self.sys.init_q + jax.random.uniform(rng_state, (self.sys.q_size(),), minval=-0.1, maxval=0.1),
+            init_q + jax.random.uniform(rng_state, (self.sys.q_size(),), minval=-0.1, maxval=0.1),
             jnp.zeros(self.sys.qd_size())
         )
         obs = self._get_obs(pipeline_state, target_idx=jnp.array(0))
@@ -178,7 +186,7 @@ class UAVTrackingEnv(PipelineEnv):
         target_idx = jnp.where(reached, next_idx, target_idx).astype(jnp.float32)
 
         done = jnp.where(uav_pos[2] < 0.1, 1.0, 0.0)
-        done = jnp.where(distance > 5.0, 1.0, done)
+        done = jnp.where(distance > 20.0, 1.0, done)
 
         obs = self._get_obs(pipeline_state, target_idx.astype(jnp.int32))
         
@@ -327,10 +335,16 @@ def main():
     state = jit_reset(rng_reset)
     print("UAV Takeoff!")
 
-    for step in range(100):
+    # List to store trajectory states for visualization
+    rollout = [state.pipeline_state]
+
+    for step in range(150):
         rng, rng_act = jax.random.split(rng)
         ctrl, _ = jit_policy(state.obs, rng_act)
         state = jit_step(state, ctrl)
+        
+        # Save state for rendering
+        rollout.append(state.pipeline_state)
 
         if step % 10 == 0:
             dist = state.metrics['distance_to_target']
@@ -342,6 +356,13 @@ def main():
             break
 
     print("All processes demonstrated successfully!")
+    
+    # Generate HTML Visualization
+    print("\n[Visualization] Generating 3D flight trajectory HTML...")
+    html_content = html.render(env_2.sys.tree_replace({'opt.timestep': env_2.dt}), rollout)
+    with open("uav_flight_trajectory.html", "w") as f:
+        f.write(html_content)
+    print("Visualization saved to 'uav_flight_trajectory.html'. Download it from Kaggle outputs to view the flight!")
 
 if __name__ == "__main__":
     main()
