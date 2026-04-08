@@ -9,6 +9,8 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 # ADD: Disable pmap-based multi-device compilation; Brax 0.14 uses sharding instead
 os.environ["BRAX_DISABLE_PMAP"] = "1"
+# CRITICAL OOM FIX: Force XLA compiler to use fewer threads to avoid blowing up Host RAM during graph compilation
+os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false"
 
 import jax
 from jax import numpy as jnp
@@ -54,7 +56,7 @@ def parse_dataframe(df, num_points):
         y_col = next((c for c in cols if c.lower() in ['y', 'ty'] or c.lower().endswith('.y') or c.lower().endswith('_y')), None)
         z_col = next((c for c in cols if c.lower() in ['z', 'tz'] or c.lower().endswith('.z') or c.lower().endswith('_z')), None)
         if x_col and y_col and z_col:
-            return np.column_stack[(df[x_col], df[y_col], df[z_col])]
+            return np.column_stack((df[x_col], df[y_col], df[z_col]))
         else:
             raise ValueError(f"Unrecognized column names. Available columns are: {cols}")
 
@@ -238,25 +240,23 @@ def main():
     gc.collect()
 
     # ADD: Wrap ppo.train inside the mesh context so sharding replaces pmap
-    # num_envs must be divisible by device count (8): 8*n
-    # Balance: num_envs(64) * unroll_length(10) / num_minibatches(8) = 80 per minibatch ✓
     with mesh:
         make_inference_fn_1, params_1, _ = ppo.train(
             environment=env_1,
-            num_timesteps=20_000,
+            num_timesteps=10_000,
             num_evals=2,
             reward_scaling=1.0,
             episode_length=50,
-            normalize_observations=True,
+            normalize_observations=False,  # CRITICAL FIX: MUST BE FALSE to prevent Host RAM OOM
             action_repeat=1,
-            unroll_length=10,
-            num_minibatches=8,       # FIX: Must equal device count (8) for correct sharding
+            unroll_length=5,         # Ultra-minimal unroll length to reduce graph size
+            num_minibatches=8,       
             num_updates_per_batch=2,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
-            num_envs=64,             # FIX: Must be divisible by 8 (device count)
-            batch_size=64,
+            num_envs=16,             # CRITICAL FIX: Keep extremely low for TPU compilation memory limit
+            batch_size=10,           # (16 * 5) / 8 minibatches = 10
             seed=42,
         )
     print("Stage 1 training completed successfully.")
@@ -291,21 +291,21 @@ def main():
     with mesh:
         make_inference_fn_2, params_2, _ = ppo.train(
             environment=env_2,
-            num_timesteps=20_000,
+            num_timesteps=10_000,
             num_evals=2,
             restore_params=params_1,  # <--- Inherit weights from Stage 1
             reward_scaling=1.0,
             episode_length=50,
-            normalize_observations=True,
+            normalize_observations=False,  # CRITICAL FIX: MUST match Stage 1
             action_repeat=1,
-            unroll_length=10,
-            num_minibatches=8,       # FIX: Matched to Stage 1
+            unroll_length=5,
+            num_minibatches=8,       
             num_updates_per_batch=2,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
-            num_envs=64,
-            batch_size=64,
+            num_envs=16,
+            batch_size=10,
             seed=99,
         )
     print("Stage 2 continual training completed.")
