@@ -9,19 +9,11 @@ import warnings
 # Suppress Brax deprecation warnings (since we are correctly using MJX backend)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# --- THE REAL OOM KILLER: COMPILER DOWNGRADE ---
-# Stop JAX from pre-allocating all TPU memory
+# --- THE REAL FIX: STABLE COMPILATION ---
+# Stop JAX from pre-allocating all TPU memory, allowing the system to breathe
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-
-# THIS IS THE KEY TO FIXING THE 300GB+ RAM EXPLOSION:
-# We force the XLA compiler to optimization level 0 (or 1) during LLVM passes.
-# This prevents the compiler from exhaustively unrolling the massive MuJoCo physics graph,
-# which is the actual root cause of Kaggle Kernel Restarts.
-os.environ["XLA_FLAGS"] = (
-    "--xla_cpu_multi_thread_eigen=false "
-    "--xla_backend_optimization_level=0"
-)
+# Prevent XLA compiler from spawning too many threads during graph compilation
+os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false"
 
 import jax
 from jax import numpy as jnp
@@ -241,9 +233,9 @@ def main():
     env_1 = UAVTrackingEnv(waypoints_batch1)
     gc.collect()
 
-    # Wrapped in mesh context for sharding (Opus suggestion)
-    # Math check: num_envs(64) * unroll_length(10) = 640
-    # batch_size(64) * num_minibatches(10) = 640
+    # ABSOLUTE MINIMAL GRAPH SIZE CONFIGURATION
+    # Math check: num_envs(16) * unroll_length(5) = 80
+    # batch_size(16) * num_minibatches(5) = 80
     with mesh:
         make_inference_fn_1, params_1, _ = ppo.train(
             environment=env_1,
@@ -251,16 +243,16 @@ def main():
             num_evals=2,
             reward_scaling=1.0,
             episode_length=50,
-            normalize_observations=True, 
+            normalize_observations=False, # CRITICAL: MUST BE FALSE TO AVOID SEGFAULT
             action_repeat=1,
-            unroll_length=10,        
-            num_minibatches=10,       
+            unroll_length=5,              # Minimized unroll length
+            num_minibatches=5,            # Perfectly matched
             num_updates_per_batch=2,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
-            num_envs=64,            
-            batch_size=64,           
+            num_envs=16,                  # 2 envs per TPU core, tiny and safe
+            batch_size=16,                # Perfectly matched
             seed=42,
         )
     print("Stage 1 training completed successfully.")
@@ -300,16 +292,16 @@ def main():
             restore_params=params_1,  # Inherit weights from Stage 1
             reward_scaling=1.0,
             episode_length=50,
-            normalize_observations=True,
+            normalize_observations=False, # CRITICAL: MUST MATCH STAGE 1
             action_repeat=1,
-            unroll_length=10,
-            num_minibatches=10,       
+            unroll_length=5,
+            num_minibatches=5,       
             num_updates_per_batch=2,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
-            num_envs=64,
-            batch_size=64,
+            num_envs=16,
+            batch_size=16,
             seed=99,
         )
     print("Stage 2 continual training completed.")
