@@ -21,10 +21,11 @@ import gc  # Added for forced garbage collection
 
 # Restrict JAX from pre-allocating all memory to mitigate Out-Of-Memory (OOM) issues
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform" # Forces JAX to use the system memory allocator
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Forces JAX to use the system memory allocator
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"  # ADD: Prevent over-parallelism during compilation
 
 import glob
-from huggingface_hub import HfApi, snapshot_download # The ultimate solution for massive file repositories
+from huggingface_hub import HfApi, snapshot_download  # The ultimate solution for massive file repositories
 
 # ==========================================
 # 1. Data Processing and Batch Loading Logic
@@ -91,7 +92,7 @@ def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_point
     
     # Get the list of locally downloaded CSV files
     local_csvs = glob.glob(os.path.join(local_dir, "**/*.csv"), recursive=True)
-    local_csvs.sort() # Sort to ensure consistency in extraction
+    local_csvs.sort()  # Sort to ensure consistency in extraction
     
     if not local_csvs:
         raise FileNotFoundError("Could not find downloaded CSV files locally!")
@@ -184,12 +185,12 @@ class UAVTrackingEnv(Env):
         target_pos = self.waypoints[target_idx]
         distance = jnp.linalg.norm(uav_pos - target_pos)
         
-        reward = -distance 
+        reward = -distance
         
         reached = distance < 0.2
         target_idx = jnp.where(reached, jnp.minimum(target_idx + 1, self.num_waypoints - 1), target_idx)
         
-        done = jnp.where(uav_pos[2] < 0.1, 1.0, 0.0) 
+        done = jnp.where(uav_pos[2] < 0.1, 1.0, 0.0)
         done = jnp.where(distance > 5.0, 1.0, done)
         
         obs = self._get_obs(data, target_idx)
@@ -248,32 +249,40 @@ def main():
     # Force Garbage Collection before heavy XLA compilation
     gc.collect()
     
-    # EXTREME MEMORY SAVING MODE: 
-    # Ensuring that num_envs * unroll_length == batch_size * num_minibatches (64*10 == 64*10)
+    # EXTREME MEMORY SAVING MODE:
+    # Ensuring that num_envs * unroll_length is divisible by num_minibatches (32*5=160, 160/4=40 ✓)
     make_inference_fn_1, params_1, _ = ppo.train(
         environment=env_1,
-        num_timesteps=20_000,    # Reduced further for a lightning-fast compilation demo
-        num_evals=5,
+        num_timesteps=10_000,    # REDUCED: 20k -> 10k to shrink compilation graph
+        num_evals=2,             # REDUCED: 5 -> 2, fewer evals means fewer recompilations
         reward_scaling=1.0,
-        episode_length=100,      # Reduced to minimize graph size
+        episode_length=50,       # REDUCED: 100 -> 50, biggest single graph-size driver
         normalize_observations=True,
         action_repeat=1,
-        unroll_length=10,        # Minimal unroll
-        num_minibatches=10,      # Perfectly balanced with num_envs and batch_size  
-        num_updates_per_batch=4,
+        unroll_length=5,         # REDUCED: 10 -> 5
+        num_minibatches=4,       # REDUCED: rebalanced (32*5=160, 160/4=40 ✓)
+        num_updates_per_batch=2, # REDUCED: 4 -> 2, less inner-loop unrolling during compilation
         discounting=0.99,
         learning_rate=3e-4,
         entropy_cost=1e-3,
-        num_envs=64,             # Ultra-low to absolutely prevent Host RAM OOM 
-        batch_size=64,           # Scaled to exactly match 
+        num_envs=32,             # REDUCED: 64 -> 32, single biggest host RAM saver
+        batch_size=32,           # REDUCED: must match num_envs
         seed=42,
     )
     print("Stage 1 training completed successfully.")
 
+    # --- Force JAX compilation cache eviction before Stage 2 ---
+    # ADD: Without this, Stage 1 and Stage 2 compiled graphs coexist in RAM causing OOM
+    print("\n[Memory Cleanup] Clearing JAX compilation cache...")
+    jax.clear_caches()  # ADD: Evicts all XLA compiled function cache from host RAM
+    del env_1           # ADD: Release Stage 1 env reference to free associated memory
+    gc.collect()
+    print("Cache cleared.")
+
     # --- Forced Cooldown (CD): Ensure 5 minutes (300 seconds) have passed since Batch 1 download ---
     print("\n[API Protection Mechanism] ------------------------------------------")
     elapsed_time = time.time() - stage1_start_time
-    wait_target = 310 # Wait 310 seconds to safely pass the 5-minute limit
+    wait_target = 310  # Wait 310 seconds to safely pass the 5-minute limit
     
     if elapsed_time < wait_target:
         sleep_duration = wait_target - elapsed_time
@@ -295,23 +304,24 @@ def main():
     gc.collect()
     
     # CORE: Pass restore_params=params_1 to inherit memories from Stage 1
+    # Keep all params identical to Stage 1 to reuse the cached XLA compilation
     make_inference_fn_2, params_2, _ = ppo.train(
         environment=env_2,
-        num_timesteps=20_000,   
-        num_evals=5,
-        restore_params=params_1,  # <--- Inherit old weights here
+        num_timesteps=10_000,    # REDUCED: matched to Stage 1
+        num_evals=2,             # REDUCED: matched to Stage 1
+        restore_params=params_1, # <--- Inherit old weights here
         reward_scaling=1.0,
-        episode_length=100,      
+        episode_length=50,       # REDUCED: matched to Stage 1
         normalize_observations=True,
         action_repeat=1,
-        unroll_length=10,        
-        num_minibatches=10,        
-        num_updates_per_batch=4,
+        unroll_length=5,         # REDUCED: matched to Stage 1
+        num_minibatches=4,       # REDUCED: matched to Stage 1
+        num_updates_per_batch=2, # REDUCED: matched to Stage 1
         discounting=0.99,
         learning_rate=3e-4,
         entropy_cost=1e-3,
-        num_envs=64,             
-        batch_size=64,          
+        num_envs=32,             # REDUCED: matched to Stage 1
+        batch_size=32,           # REDUCED: matched to Stage 1
         seed=99,
     )
     print("Stage 2 continual training completed.")
