@@ -32,7 +32,7 @@ import numpy as np
 import ast
 import time
 import glob
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, snapshot_download, login
 
 # ==========================================
 # 1. Data Processing and Batch Loading Logic
@@ -99,9 +99,7 @@ def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_point
 # ==========================================
 # 2. MuJoCo UAV (Quadrotor) Model Definition (XML)
 # ==========================================
-# THE ULTIMATE OOM FIX: Changed integrator from "RK4" to "Euler". 
-# RK4 evaluates physics derivatives 4 times per step, multiplying the XLA compilation graph size by 4x,
-# causing the 330GB+ Host RAM explosion. Euler evaluates once, dropping RAM usage by 75%+ during compilation.
+# Integrator changed to "Euler" to prevent XLA compiler memory explosion (OOM) on TPU.
 UAV_XML = """
 <mujoco model="quadrotor">
   <compiler angle="degree" inertiafromgeom="true"/>
@@ -149,7 +147,7 @@ class UAVTrackingEnv(PipelineEnv):
     def reset(self, rng: jnp.ndarray) -> State:
         rng, rng_state = jax.random.split(rng)
         
-        # FIX: Spawn UAV near the first waypoint instead of (0,0,1)
+        # Spawn UAV near the first waypoint
         target_pos = self.waypoints[0]
         # 1.0m to Z axis to ensure it spawns safely above ground
         init_pos = target_pos + jnp.array([0.0, 0.0, 1.0])
@@ -179,14 +177,16 @@ class UAVTrackingEnv(PipelineEnv):
         target_pos = self.waypoints[target_idx]
         distance = jnp.linalg.norm(uav_pos - target_pos)
 
+        # Reward formulation: negative distance to encourage closing the gap
         reward = -distance
 
         reached = distance < 0.2
         next_idx = jnp.minimum(target_idx + 1, self.num_waypoints - 1)
         target_idx = jnp.where(reached, next_idx, target_idx).astype(jnp.float32)
 
-        done = jnp.where(uav_pos[2] < 0.1, 1.0, 0.0)
-        done = jnp.where(distance > 20.0, 1.0, done)
+        # Termination conditions
+        done = jnp.where(uav_pos[2] < 0.1, 1.0, 0.0) # Crashed into ground
+        done = jnp.where(distance > 20.0, 1.0, done) # Flew too far away
 
         obs = self._get_obs(pipeline_state, target_idx.astype(jnp.int32))
         
@@ -234,23 +234,25 @@ def main():
     stage1_start_time = time.time()
 
     # --- STAGE 1 ---
+
+    # Global timer to measure end-to-end execution time
+    pipeline_start_time = time.time()
+
     print("\n[STAGE 1] ---------------------------------------------")
     waypoints_batch1 = download_batch_and_extract_demo(REPO_ID, batch1_files, hf_token, num_demo_points=4)
 
     print("\nStarting Stage 1 PPO training (Based on Batch 1 data)...")
     env_1 = UAVTrackingEnv(waypoints_batch1)
 
-    # With Euler integrator, compilation memory is drastically reduced.
-    # We can now safely use a balanced batch configuration.
-    # Math check: num_envs(128) * unroll_length(10) = 1280 transitions
-    # batch_size(80) * num_minibatches(16) = 1280 transitions
     with mesh:
         make_inference_fn_1, params_1, _ = ppo.train(
             environment=env_1,
-            num_timesteps=10_000,
-            num_evals=2,
+            # INCREASED: Give it enough steps to learn how to fly
+            num_timesteps=2_000_000, 
+            num_evals=5,
             reward_scaling=1.0,
-            episode_length=50,
+            # INCREASED: 500 steps = 5 seconds physics time (gives it time to fly)
+            episode_length=500,      
             normalize_observations=False, 
             action_repeat=1,
             unroll_length=10,        
@@ -268,7 +270,6 @@ def main():
     # --- Memory Cleanup between stages ---
     print("\n[Memory Cleanup] Clearing JAX compilation cache...")
     jax.clear_caches()
-    # Explicitly clear old env to free up CPU RAM
     del env_1
     import gc
     gc.collect()
@@ -296,11 +297,13 @@ def main():
     with mesh:
         make_inference_fn_2, params_2, _ = ppo.train(
             environment=env_2,
-            num_timesteps=10_000,
-            num_evals=2,
+            # INCREASED: Give it enough steps to learn
+            num_timesteps=2_000_000,
+            num_evals=5,
             restore_params=params_1,  # Inherit weights from Stage 1
             reward_scaling=1.0,
-            episode_length=50,
+            # INCREASED: Match Stage 1 episode length
+            episode_length=500,
             normalize_observations=False, 
             action_repeat=1,
             unroll_length=10,
@@ -315,6 +318,15 @@ def main():
         )
     print("Stage 2 continual training completed.")
 
+    pipeline_end_time = time.time()
+    total_time_seconds = pipeline_end_time - pipeline_start_time
+    minutes = int(total_time_seconds // 60)
+    seconds = int(total_time_seconds % 60)
+    
+    print("\n=======================================================")
+    print(f"TOTAL INFERENCE PIPELINE TIME: {minutes} minutes and {seconds} seconds")
+    print("=======================================================")
+
     # --- STAGE 3: Save model ---
     print("\n[Wrap Up] ---------------------------------------------")
     model_path = "uav_continual_ppo_policy.pkl"
@@ -324,7 +336,19 @@ def main():
     # --- STAGE 4: Inference ---
     print("\nStarting UAV flight test on Batch 2 trajectories...")
     loaded_params = brax_model.load_params(model_path)
-    policy_fn = make_inference_fn_2(loaded_params)
+
+    # Standalone Inference Reconstruction
+    from brax.training.agents.ppo import networks as ppo_networks
+    from brax.training.agents.ppo import train as ppo_train
+
+    ppo_network = ppo_networks.make_ppo_networks(
+        env_2.observation_size,
+        env_2.action_size,
+        preprocess_observations_fn=lambda x, y: x  
+    )
+
+    standalone_inference_generator = ppo_networks.make_inference_fn(ppo_network)
+    policy_fn = standalone_inference_generator(loaded_params)
 
     jit_reset  = jax.jit(env_2.reset)
     jit_step   = jax.jit(env_2.step)
@@ -335,34 +359,34 @@ def main():
     state = jit_reset(rng_reset)
     print("UAV Takeoff!")
 
-    # List to store trajectory states for visualization
     rollout = [state.pipeline_state]
 
-    for step in range(150):
+    # INCREASED: Allow recording up to 500 frames (5 seconds physics time)
+    for step in range(500):
         rng, rng_act = jax.random.split(rng)
         ctrl, _ = jit_policy(state.obs, rng_act)
         state = jit_step(state, ctrl)
         
-        # Save state for rendering
         rollout.append(state.pipeline_state)
 
-        if step % 10 == 0:
+        if step % 50 == 0:
             dist = state.metrics['distance_to_target']
             target_idx = state.metrics['target_idx']
             print(f"Time Step {step:03d} | Tracking Waypoint {int(target_idx)} | Distance Error: {dist:.3f} m")
 
         if state.done:
-            print(f"UAV crashed or flew out of bounds. Episode terminated early at step {step}.")
+            dist = state.metrics['distance_to_target']
+            print(f"Episode terminated early at step {step}. Final Distance: {dist:.3f} m")
             break
 
-    print("All processes demonstrated successfully!")
+    print("Inference flight sequence completed!")
     
-    # Generate HTML Visualization
     print("\n[Visualization] Generating 3D flight trajectory HTML...")
     html_content = html.render(env_2.sys.tree_replace({'opt.timestep': env_2.dt}), rollout)
-    with open("uav_flight_trajectory.html", "w") as f:
+    html_path = "uav_flight_trajectory.html"
+    with open(html_path, "w") as f:
         f.write(html_content)
-    print("Visualization saved to 'uav_flight_trajectory.html'. Download it from Kaggle outputs to view the flight!")
+    print(f"Visualization saved to '{html_path}'.")
 
 if __name__ == "__main__":
     main()
