@@ -310,12 +310,12 @@ def main():
     # --- STAGE 3: Save model ---
     print("\n[Wrap Up] ---------------------------------------------")
     model_path = "uav_continual_ppo_policy.pkl"
-    brax_model.save(params_2, model_path)
+    brax_model.save_params(model_path, params_2)
     print(f"Final model saved to: '{model_path}'")
 
     # --- STAGE 4: Inference ---
     print("\nStarting UAV flight test on Batch 2 trajectories...")
-    loaded_params = brax_model.load(model_path)
+    loaded_params = brax_model.load_params(model_path)
     policy_fn = make_inference_fn_2(loaded_params)
 
     jit_reset  = jax.jit(env_2.reset)
