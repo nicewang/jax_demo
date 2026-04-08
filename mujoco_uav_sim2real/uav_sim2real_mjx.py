@@ -11,62 +11,92 @@ from brax import envs
 from brax.envs.base import State, Env
 from brax.training.agents.ppo import train as ppo
 from brax.io import model as brax_model  # For saving and loading models
-from datasets import load_dataset, Dataset
+
+import pandas as pd
 import numpy as np
 import ast
 import time
+import os
+import glob
+from huggingface_hub import HfApi, snapshot_download # The ultimate solution for massive file repositories
 
 # ==========================================
-# 1. Hugging Face Dataset Integration 
+# 1. Data Processing and Batch Loading Logic
 # ==========================================
-def load_hf_trajectory_dataset(num_points=10, hf_token=None):
-    """
-    Load real-world UAV flight trajectory data from Hugging Face Hub.
-    Using open-source dataset: riotu-lab/Synthetic-UAV-Flight-Trajectories
-    """
-    print(f"Downloading {num_points} waypoints from Hugging Face...")
+def parse_dataframe(df, num_points):
+    """Helper function: Parse coordinate points from DataFrames with different structures"""
+    df = df.head(num_points)
+    cols = df.columns.tolist()
     
-    try:
-        # Pass the token here to authenticate and bypass IP rate limits
-        dataset = load_dataset("riotu-lab/Synthetic-UAV-Flight-Trajectories", split="train", token=hf_token)
-        subset = dataset.select(range(num_points))
+    # 1. Exact match for standard coordinates
+    if 'x' in cols and 'y' in cols and 'z' in cols:
+        return np.column_stack((df['x'], df['y'], df['z']))
         
-        cols = subset.column_names
-        print(f"Detected columns in dataset: {cols}")
+    # 2. Exact match for translation coordinates (tx, ty, tz)
+    elif 'tx' in cols and 'ty' in cols and 'tz' in cols:
+        return np.column_stack((df['tx'], df['ty'], df['tz']))
         
-        # 1. Exact match (Standard)
-        if 'x' in cols and 'y' in cols and 'z' in cols:
-            waypoints = np.column_stack((subset['x'], subset['y'], subset['z']))
-            
-        # 2. String/Array column match
-        elif 'position' in cols:
-            positions = subset['position']
-            if isinstance(positions[0], str):
-                positions = [ast.literal_eval(p) for p in positions]
-            waypoints = np.array(positions)
-            
-        # 3. Dynamic match (handles ROS/Gazebo CSV exports like 'field.pose.position.x')
+    # 3. String/Array column match
+    elif 'position' in cols:
+        positions = df['position'].tolist()
+        if isinstance(positions[0], str):
+            positions = [ast.literal_eval(p) for p in positions]
+        return np.array(positions)
+        
+    # 4. Dynamic match for complex/nested names (handles .x, _x, tx, etc.)
+    else:
+        x_col = next((c for c in cols if c.lower() in ['x', 'tx'] or c.lower().endswith('.x') or c.lower().endswith('_x')), None)
+        y_col = next((c for c in cols if c.lower() in ['y', 'ty'] or c.lower().endswith('.y') or c.lower().endswith('_y')), None)
+        z_col = next((c for c in cols if c.lower() in ['z', 'tz'] or c.lower().endswith('.z') or c.lower().endswith('_z')), None)
+        
+        if x_col and y_col and z_col:
+            return np.column_stack((df[x_col], df[y_col], df[z_col]))
         else:
-            x_col = next((c for c in cols if c.lower() == 'x' or c.lower().endswith('.x') or c.lower().endswith('_x')), None)
-            y_col = next((c for c in cols if c.lower() == 'y' or c.lower().endswith('.y') or c.lower().endswith('_y')), None)
-            z_col = next((c for c in cols if c.lower() == 'z' or c.lower().endswith('.z') or c.lower().endswith('_z')), None)
-            
-            if x_col and y_col and z_col:
-                print(f"Dynamically matched columns: X='{x_col}', Y='{y_col}', Z='{z_col}'")
-                waypoints = np.column_stack((subset[x_col], subset[y_col], subset[z_col]))
-            else:
-                raise ValueError(f"Columns not recognized. Available columns were: {cols}")
-            
-        print(f"Successfully loaded {len(waypoints)} waypoints!")
-        
-    except Exception as e:
-        print(f"Could not load HF dataset online ({e}). Using local fallback trajectory...")
-        waypoints = np.array([
-            [1.0, 0.0, 2.0], [2.0, 1.0, 2.5], [2.0, -1.0, 2.0], [0.0, 0.0, 1.5],
-            [1.0, 1.0, 1.5], [2.0, 2.0, 2.0], [3.0, 1.0, 2.5], [3.0, 0.0, 2.0],
-            [2.0, -1.0, 1.5], [1.0, 0.0, 1.0]
-        ])
+            raise ValueError(f"Unrecognized column names. Available columns are: {cols}")
 
+def get_csv_file_lists(repo_id, hf_token=None):
+    """Get all CSV filenames in the repo and split them equally into two batches"""
+    print(f"Fetching full file list from {repo_id}...")
+    api = HfApi(token=hf_token)
+    all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    csv_files = [f for f in all_files if f.endswith('.csv')]
+    
+    mid_point = len(csv_files) // 2
+    batch1 = csv_files[:mid_point]
+    batch2 = csv_files[mid_point:]
+    
+    print(f"Discovered a total of {len(csv_files)} CSV files.")
+    print(f"Split into two batches: Batch 1 ({len(batch1)} files), Batch 2 ({len(batch2)} files).")
+    return batch1, batch2
+
+def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_points=4):
+    """
+    Download specified batch of files (multi-threaded), and extract a certain number of waypoints for Demo training.
+    """
+    print(f"\nStarting batch download ({len(file_list)} files in total)...")
+    # snapshot_download will fast-download files specified in allow_patterns using multiple threads
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        allow_patterns=file_list,
+        token=hf_token,
+        max_workers=8
+    )
+    
+    # Get the list of locally downloaded CSV files
+    local_csvs = glob.glob(os.path.join(local_dir, "**/*.csv"), recursive=True)
+    local_csvs.sort() # Sort to ensure consistency in extraction
+    
+    if not local_csvs:
+        raise FileNotFoundError("Could not find downloaded CSV files locally!")
+        
+    print(f"Batch download complete! {len(local_csvs)} related files exist locally.")
+    print(f"Extracting {num_demo_points} trajectory points from the first file ({os.path.basename(local_csvs[0])})...")
+    
+    df = pd.read_csv(local_csvs[0])
+    waypoints = parse_dataframe(df, num_points=num_demo_points)
+    
+    print(f"Successfully extracted {len(waypoints)} waypoints!")
     return jnp.array(waypoints)
 
 # ==========================================
@@ -107,7 +137,7 @@ UAV_XML = """
 """
 
 # ==========================================
-# 3. Brax/MJX RL Environment
+# 3. Brax/MJX Reinforcement Learning Environment
 # ==========================================
 class UAVTrackingEnv(Env):
     def __init__(self, waypoints):
@@ -121,14 +151,13 @@ class UAVTrackingEnv(Env):
         rng, rng_state = jax.random.split(rng)
         data = mjx.make_data(self.sys_mjx)
         
-        # Initial position perturbation
+        # Initial pose random perturbation
         qpos = self.sys_mjx.qpos0 + jax.random.uniform(rng_state, (self.sys.nq,), minval=-0.1, maxval=0.1)
         data = data.replace(qpos=qpos)
         
         data = mjx.forward(self.sys_mjx, data)
         obs = self._get_obs(data, target_idx=0)
         
-        # Calculate initial distance
         uav_pos = data.qpos[:3]
         target_pos = self.waypoints[0]
         initial_distance = jnp.linalg.norm(uav_pos - target_pos)
@@ -180,10 +209,10 @@ class UAVTrackingEnv(Env):
     def observation_size(self): return 13
 
 # ==========================================
-# 4. Main Flow: Train -> Save -> Load -> Inference
+# 4. Main Flow: Batch Download -> Interval Training -> Forced CD -> Continual Training
 # ==========================================
 def main():
-    print(f"JAX Devices: {jax.device_count()} (TPU cores expected: 8 on Kaggle)")
+    print(f"JAX Hardware Devices: {jax.device_count()} (Should be 8 TPU cores on Kaggle)")
     
     # --- GET HUGGING FACE TOKEN ---
     hf_token = None
@@ -192,24 +221,27 @@ def main():
         user_secrets = UserSecretsClient()
         hf_token = user_secrets.get_secret("HF_TOKEN_WRITE")
         print("Successfully retrieved HF_TOKEN_WRITE from Kaggle Secrets!")
-    except ImportError:
-        print("Not running in Kaggle environment (kaggle_secrets not found). Proceeding without token.")
-    except Exception as e:
-        print(f"Failed to retrieve HF token from Kaggle Secrets: {e}")
+    except Exception:
+        print("Kaggle Secrets not detected, attempting in anonymous mode.")
         
-    # --- PHASE 1: PREPARE ENV ---
-    # Pass the retrieved token to the dataset loading function
-    waypoints = load_hf_trajectory_dataset(num_points=8, hf_token=hf_token) # 10 points for quick demo
-    env = UAVTrackingEnv(waypoints)
+    REPO_ID = "riotu-lab/Synthetic-UAV-Flight-Trajectories"
     
-    # --- PHASE 2: TRAINING ---
-    print("\n--- Starting PPO Training ---")
-    start_time = time.time()
+    # Get two batches of file lists
+    batch1_files, batch2_files = get_csv_file_lists(REPO_ID, hf_token)
     
-    # Reduced num_timesteps to 100,000 so it finishes in a few minutes on Kaggle
-    make_inference_fn, params, _ = ppo.train(
-        environment=env,
-        num_timesteps=100_000,   
+    # Record the start time of the first batch download + training
+    stage1_start_time = time.time()
+    
+    # --- STAGE 1: Download Batch 1, extract 4 tracks and train ---
+    print("\n[STAGE 1] ---------------------------------------------")
+    waypoints_batch1 = download_batch_and_extract_demo(REPO_ID, batch1_files, hf_token, num_demo_points=4)
+    
+    print("\nStarting Stage 1 PPO training (Based on Batch 1 data)...")
+    env_1 = UAVTrackingEnv(waypoints_batch1)
+    
+    make_inference_fn_1, params_1, _ = ppo.train(
+        environment=env_1,
+        num_timesteps=50_000,   
         num_evals=5,
         reward_scaling=1.0,
         episode_length=200,      
@@ -221,60 +253,91 @@ def main():
         discounting=0.99,
         learning_rate=3e-4,
         entropy_cost=1e-3,
-        num_envs=2048,           # Utilize TPU parallelization
+        num_envs=2048,
         batch_size=1024,
         seed=42,
     )
-    print(f"Training finished in {time.time() - start_time:.2f} seconds.")
+    print("Stage 1 training completed successfully.")
 
-    # --- PHASE 3: SAVING MODEL ---
-    print("\n--- Saving Model ---")
-    model_path = "uav_ppo_policy.pkl"
-    brax_model.save(params, model_path)
-    print(f"Model successfully saved to '{model_path}'.")
-
-    # --- PHASE 4: INFERENCE (TESTING THE LOADED MODEL) ---
-    print("\n--- Running Inference with Saved Model ---")
+    # --- Forced Cooldown (CD): Ensure 5 minutes (300 seconds) have passed since Batch 1 download ---
+    print("\n[API Protection Mechanism] ------------------------------------------")
+    elapsed_time = time.time() - stage1_start_time
+    wait_target = 310 # Wait 310 seconds to safely pass the 5-minute limit
     
-    # 1. Load params from disk
+    if elapsed_time < wait_target:
+        sleep_duration = wait_target - elapsed_time
+        print(f"Only {elapsed_time:.1f} seconds have passed since the first API request.")
+        print(f"To prevent triggering Hugging Face's 5000 requests/5 min limit, the program will sleep for {sleep_duration:.1f} seconds...")
+        time.sleep(sleep_duration)
+        print("Wait over! API quota has been reset.")
+    else:
+        print(f"Stage 1 took {elapsed_time:.1f} seconds, safely exceeding the 5-minute limit. Continuing directly!")
+
+    # --- STAGE 2: Download Batch 2, extract 4 tracks and continual train ---
+    print("\n[STAGE 2] ---------------------------------------------")
+    waypoints_batch2 = download_batch_and_extract_demo(REPO_ID, batch2_files, hf_token, num_demo_points=4)
+    
+    print("\nStarting Stage 2 Continual Learning...")
+    env_2 = UAVTrackingEnv(waypoints_batch2)
+    
+    # CORE: Pass restore_params=params_1 to inherit memories from Stage 1
+    make_inference_fn_2, params_2, _ = ppo.train(
+        environment=env_2,
+        num_timesteps=50_000,   
+        num_evals=5,
+        restore_params=params_1,  # <--- Inherit old weights here
+        reward_scaling=1.0,
+        episode_length=200,      
+        normalize_observations=True,
+        action_repeat=1,
+        unroll_length=20,
+        num_minibatches=32,        
+        num_updates_per_batch=4,
+        discounting=0.99,
+        learning_rate=3e-4,
+        entropy_cost=1e-3,
+        num_envs=2048,
+        batch_size=1024,
+        seed=99,
+    )
+    print("Stage 2 continual training completed.")
+
+    # --- STAGE 3: Save the final continual learning model ---
+    print("\n[Wrap Up] ---------------------------------------------")
+    model_path = "uav_continual_ppo_policy.pkl"
+    brax_model.save(params_2, model_path)
+    print(f"The final continual training model has been saved to: '{model_path}'")
+
+    # --- STAGE 4: Flight test (Inference) on Batch 2 waypoints ---
+    print("\nStarting UAV flight test on Batch 2 trajectories...")
     loaded_params = brax_model.load(model_path)
-    print("Model loaded from disk.")
+    policy_fn = make_inference_fn_2(loaded_params)
     
-    # 2. Create the policy function using the loaded params
-    # (make_inference_fn handles the observation normalization internally)
-    policy_fn = make_inference_fn(loaded_params)
-    
-    # 3. JIT compile the env functions and policy for fast execution
-    jit_reset = jax.jit(env.reset)
-    jit_step = jax.jit(env.step)
+    jit_reset = jax.jit(env_2.reset)
+    jit_step = jax.jit(env_2.step)
     jit_policy = jax.jit(policy_fn)
     
-    # 4. Run a single test episode
     rng = jax.random.PRNGKey(123)
     rng, rng_reset = jax.random.split(rng)
     
     state = jit_reset(rng_reset)
-    print("Takeoff!")
+    print("UAV Takeoff!")
     
     for step in range(200):
         rng, rng_act = jax.random.split(rng)
-        
-        # Get action from the loaded policy
         ctrl, _ = jit_policy(state.obs, rng_act)
-        
-        # Step the environment
         state = jit_step(state, ctrl)
         
         if step % 20 == 0:
             dist = state.metrics['distance_to_target']
             target_idx = state.metrics['target_idx']
-            print(f"Step {step:03d} | Tracking Waypoint {target_idx} | Distance Error: {dist:.3f}m")
+            print(f"Time Step {step:03d} | Tracking Waypoint {target_idx} | Distance Error: {dist:.3f} m")
             
         if state.done:
-            print(f"Episode terminated early at step {step} (Crashed or went out of bounds).")
+            print(f"UAV crashed or flew out of bounds. Episode terminated early at step {step}.")
             break
             
-    print("Inference Demo Complete!")
+    print("All processes demonstrated successfully!")
 
 if __name__ == "__main__":
     main()
