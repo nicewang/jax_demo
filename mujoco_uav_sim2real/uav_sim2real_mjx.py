@@ -239,7 +239,7 @@ def main():
     pipeline_start_time = time.time()
 
     print("\n[STAGE 1] ---------------------------------------------")
-    waypoints_batch1 = download_batch_and_extract_demo(REPO_ID, batch1_files, hf_token, num_demo_points=4)
+    waypoints_batch1 = download_batch_and_extract_demo(REPO_ID, batch1_files, hf_token, num_demo_points=None)
 
     print("\nStarting Stage 1 PPO training (Based on Batch 1 data)...")
     env_1 = UAVTrackingEnv(waypoints_batch1)
@@ -248,7 +248,7 @@ def main():
         make_inference_fn_1, params_1, _ = ppo.train(
             environment=env_1,
             # INCREASED: Give it enough steps to learn how to fly
-            num_timesteps=2_000_000, 
+            num_timesteps=5_000_000, 
             num_evals=5,
             reward_scaling=1.0,
             # INCREASED: 500 steps = 5 seconds physics time (gives it time to fly)
@@ -256,13 +256,13 @@ def main():
             normalize_observations=False, 
             action_repeat=1,
             unroll_length=10,        
-            num_minibatches=16,       
+            num_minibatches=32,       
             num_updates_per_batch=4,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
             num_envs=128,            
-            batch_size=80,           
+            batch_size=128,           
             seed=42,
         )
     print("Stage 1 training completed successfully.")
@@ -289,7 +289,7 @@ def main():
 
     # --- STAGE 2 ---
     print("\n[STAGE 2] ---------------------------------------------")
-    waypoints_batch2 = download_batch_and_extract_demo(REPO_ID, batch2_files, hf_token, num_demo_points=4)
+    waypoints_batch2 = download_batch_and_extract_demo(REPO_ID, batch2_files, hf_token, num_demo_points=None)
 
     print("\nStarting Stage 2 Continual Learning...")
     env_2 = UAVTrackingEnv(waypoints_batch2)
@@ -298,7 +298,7 @@ def main():
         make_inference_fn_2, params_2, _ = ppo.train(
             environment=env_2,
             # INCREASED: Give it enough steps to learn
-            num_timesteps=2_000_000,
+            num_timesteps=5_000_000,
             num_evals=5,
             restore_params=params_1,  # Inherit weights from Stage 1
             reward_scaling=1.0,
@@ -307,13 +307,13 @@ def main():
             normalize_observations=False, 
             action_repeat=1,
             unroll_length=10,
-            num_minibatches=16,       
+            num_minibatches=32,       
             num_updates_per_batch=4,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
             num_envs=128,
-            batch_size=80,
+            batch_size=128,
             seed=99,
         )
     print("Stage 2 continual training completed.")
