@@ -35,10 +35,11 @@ import glob
 from huggingface_hub import HfApi, snapshot_download, login
 
 # ==========================================
-# 1. Data Processing and Fast Loading Logic
+# 1. Data Processing and Batch Loading Logic
 # ==========================================
-def parse_dataframe(df):
-    """Parse coordinate points from DataFrames with different structures. No truncation."""
+def parse_dataframe(df, num_points):
+    """Helper function: Parse coordinate points from DataFrames with different structures"""
+    df = df.head(num_points)
     cols = df.columns.tolist()
 
     if 'x' in cols and 'y' in cols and 'z' in cols:
@@ -59,50 +60,41 @@ def parse_dataframe(df):
         else:
             raise ValueError(f"Unrecognized column names. Available columns are: {cols}")
 
-def download_and_prepare_data(repo_id, hf_token=None):
-    """
-    Downloads the ENTIRE repository at once to avoid HTTP Timeout errors caused by 
-    requesting thousands of files individually. Splits them locally.
-    """
-    print(f"Downloading entire dataset from {repo_id} (approx 55MB)...")
-    local_dir = snapshot_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        allow_patterns="*.csv",
-        token=hf_token,
-        max_workers=8
-    )
-    
-    all_csvs = glob.glob(os.path.join(local_dir, "**/*.csv"), recursive=True)
-    all_csvs.sort()
-    
-    if not all_csvs:
-        raise FileNotFoundError("Could not find any CSV files locally!")
-        
-    mid_point = len(all_csvs) // 2
-    batch1 = all_csvs[:mid_point]
-    batch2 = all_csvs[mid_point:]
-    
-    print(f"Download complete! Found {len(all_csvs)} CSV files.")
+def get_csv_file_lists(repo_id, hf_token=None):
+    """Get all CSV filenames in the repo and split them equally into two batches"""
+    print(f"Fetching full file list from {repo_id}...")
+    api = HfApi(token=hf_token)
+    all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    csv_files = [f for f in all_files if f.endswith('.csv')]
+    mid_point = len(csv_files) // 2
+    batch1 = csv_files[:mid_point]
+    batch2 = csv_files[mid_point:]
+    print(f"Discovered a total of {len(csv_files)} CSV files.")
     print(f"Split into two batches: Batch 1 ({len(batch1)} files), Batch 2 ({len(batch2)} files).")
     return batch1, batch2
 
-def extract_waypoints(file_list):
-    """Extracts and concatenates ALL waypoints from a list of CSV files."""
-    print(f"Extracting waypoints from {len(file_list)} files... This may take a moment.")
-    waypoints_list = []
-    
-    for f in file_list:
-        try:
-            df = pd.read_csv(f)
-            wp = parse_dataframe(df)
-            waypoints_list.append(wp)
-        except Exception as e:
-            pass # Silently skip corrupted files
-            
-    concatenated = np.concatenate(waypoints_list, axis=0)
-    print(f"Successfully extracted a total of {len(concatenated):,} waypoints!")
-    return jnp.array(concatenated, dtype=jnp.float32)
+def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_points=4):
+    """
+    Download specified batch of files (multi-threaded), and extract a certain number of waypoints for Demo training.
+    """
+    print(f"\nStarting batch download ({len(file_list)} files in total)...")
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        allow_patterns=file_list,
+        token=hf_token,
+        max_workers=8
+    )
+    local_csvs = glob.glob(os.path.join(local_dir, "**/*.csv"), recursive=True)
+    local_csvs.sort()
+    if not local_csvs:
+        raise FileNotFoundError("Could not find downloaded CSV files locally!")
+    print(f"Batch download complete! {len(local_csvs)} related files exist locally.")
+    print(f"Extracting {num_demo_points} trajectory points from the first file ({os.path.basename(local_csvs[0])})...")
+    df = pd.read_csv(local_csvs[0])
+    waypoints = parse_dataframe(df, num_points=num_demo_points)
+    print(f"Successfully extracted {len(waypoints)} waypoints!")
+    return jnp.array(waypoints, dtype=jnp.float32)
 
 # ==========================================
 # 2. MuJoCo UAV (Quadrotor) Model Definition (XML)
@@ -153,14 +145,11 @@ class UAVTrackingEnv(PipelineEnv):
         self.num_waypoints = waypoints.shape[0]
 
     def reset(self, rng: jnp.ndarray) -> State:
-        rng, rng_state, rng_idx = jax.random.split(rng, 3)
+        rng, rng_state = jax.random.split(rng)
         
-        # CRITICAL FIX FOR FULL DATASET: Spawn at a RANDOM waypoint index instead of 0.
-        # This ensures the UAV experiences all parts of the dataset during parallel training.
-        max_idx = jnp.maximum(1, self.num_waypoints - 500)
-        start_idx = jax.random.randint(rng_idx, shape=(), minval=0, maxval=max_idx)
-        
-        target_pos = self.waypoints[start_idx]
+        # Spawn UAV near the first waypoint
+        target_pos = self.waypoints[0]
+        # 1.0m to Z axis to ensure it spawns safely above ground
         init_pos = target_pos + jnp.array([0.0, 0.0, 1.0])
         init_q = self.sys.init_q.at[:3].set(init_pos)
         
@@ -168,14 +157,16 @@ class UAVTrackingEnv(PipelineEnv):
             init_q + jax.random.uniform(rng_state, (self.sys.q_size(),), minval=-0.1, maxval=0.1),
             jnp.zeros(self.sys.qd_size())
         )
-        obs = self._get_obs(pipeline_state, target_idx=start_idx)
-        
+        obs = self._get_obs(pipeline_state, target_idx=jnp.array(0))
+        uav_pos = pipeline_state.q[:3]
+        target_pos = self.waypoints[0]
+        initial_distance = jnp.linalg.norm(uav_pos - target_pos)
         return State(
             pipeline_state=pipeline_state,
             obs=obs,
             reward=jnp.array(0.0),
             done=jnp.array(0.0),
-            metrics={"target_idx": start_idx.astype(jnp.float32), "distance_to_target": jnp.array(1.0)}
+            metrics={"target_idx": jnp.array(0.0), "distance_to_target": initial_distance}
         )
 
     def step(self, state: State, action: jnp.ndarray) -> State:
@@ -195,12 +186,12 @@ class UAVTrackingEnv(PipelineEnv):
 
         # Termination conditions
         done = jnp.where(uav_pos[2] < 0.1, 1.0, 0.0) # Crashed into ground
-        done = jnp.where(distance > 20.0, 1.0, done) # Flew too far away / Teleported to next file
+        done = jnp.where(distance > 20.0, 1.0, done) # Flew too far away
 
         obs = self._get_obs(pipeline_state, target_idx.astype(jnp.int32))
         
         metrics = state.metrics.copy()
-        metrics["target_idx"] = target_idx.astype(jnp.float32)
+        metrics["target_idx"] = target_idx
         metrics["distance_to_target"] = distance
         
         return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward, done=done, metrics=metrics)
@@ -239,35 +230,39 @@ def main():
 
     REPO_ID = "riotu-lab/Synthetic-UAV-Flight-Trajectories"
 
-    # Single efficient download for all CSVs
-    batch1_files, batch2_files = download_and_prepare_data(REPO_ID, hf_token)
+    batch1_files, batch2_files = get_csv_file_lists(REPO_ID, hf_token)
     stage1_start_time = time.time()
 
     # --- STAGE 1 ---
-    print("\n[STAGE 1] ---------------------------------------------")
-    waypoints_batch1 = extract_waypoints(batch1_files)
 
-    print("\nStarting Stage 1 PPO training (Based on Full Batch 1 data)...")
+    # Global timer to measure end-to-end execution time
+    pipeline_start_time = time.time()
+
+    print("\n[STAGE 1] ---------------------------------------------")
+    waypoints_batch1 = download_batch_and_extract_demo(REPO_ID, batch1_files, hf_token, num_demo_points=4)
+
+    print("\nStarting Stage 1 PPO training (Based on Batch 1 data)...")
     env_1 = UAVTrackingEnv(waypoints_batch1)
 
     with mesh:
         make_inference_fn_1, params_1, _ = ppo.train(
             environment=env_1,
-            # MASSIVE INCREASE: 5 Million steps for full dataset training
-            num_timesteps=5_000_000, 
+            # INCREASED: Give it enough steps to learn how to fly
+            num_timesteps=2_000_000, 
             num_evals=5,
             reward_scaling=1.0,
+            # INCREASED: 500 steps = 5 seconds physics time (gives it time to fly)
             episode_length=500,      
             normalize_observations=False, 
             action_repeat=1,
             unroll_length=10,        
-            num_minibatches=32,       
+            num_minibatches=16,       
             num_updates_per_batch=4,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
             num_envs=128,            
-            batch_size=128,           
+            batch_size=80,           
             seed=42,
         )
     print("Stage 1 training completed successfully.")
@@ -276,7 +271,6 @@ def main():
     print("\n[Memory Cleanup] Clearing JAX compilation cache...")
     jax.clear_caches()
     del env_1
-    del waypoints_batch1
     import gc
     gc.collect()
     print("Cache cleared.")
@@ -284,43 +278,54 @@ def main():
     # --- Forced Cooldown ---
     print("\n[API Protection Mechanism] ------------------------------------------")
     elapsed_time = time.time() - stage1_start_time
-    wait_target = 60 # Reduced wait since we only do one major download now
+    wait_target = 310
     if elapsed_time < wait_target:
         sleep_duration = wait_target - elapsed_time
-        print(f"Only {elapsed_time:.1f}s elapsed. Sleeping {sleep_duration:.1f}s to ensure system stability...")
+        print(f"Only {elapsed_time:.1f}s elapsed. Sleeping {sleep_duration:.1f}s to reset HF API quota...")
         time.sleep(sleep_duration)
+        print("Wait over! API quota has been reset.")
     else:
-        print(f"Stage 1 took {elapsed_time:.1f}s. Continuing directly!")
+        print(f"Stage 1 took {elapsed_time:.1f}s, safely exceeding the 5-minute limit. Continuing directly!")
 
     # --- STAGE 2 ---
     print("\n[STAGE 2] ---------------------------------------------")
-    waypoints_batch2 = extract_waypoints(batch2_files)
+    waypoints_batch2 = download_batch_and_extract_demo(REPO_ID, batch2_files, hf_token, num_demo_points=4)
 
-    print("\nStarting Stage 2 Continual Learning (Based on Full Batch 2 data)...")
+    print("\nStarting Stage 2 Continual Learning...")
     env_2 = UAVTrackingEnv(waypoints_batch2)
 
     with mesh:
         make_inference_fn_2, params_2, _ = ppo.train(
             environment=env_2,
-            # MASSIVE INCREASE: 5 Million steps for full dataset training
-            num_timesteps=5_000_000,
+            # INCREASED: Give it enough steps to learn
+            num_timesteps=2_000_000,
             num_evals=5,
             restore_params=params_1,  # Inherit weights from Stage 1
             reward_scaling=1.0,
+            # INCREASED: Match Stage 1 episode length
             episode_length=500,
             normalize_observations=False, 
             action_repeat=1,
             unroll_length=10,
-            num_minibatches=32,       
+            num_minibatches=16,       
             num_updates_per_batch=4,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
             num_envs=128,
-            batch_size=128,
+            batch_size=80,
             seed=99,
         )
     print("Stage 2 continual training completed.")
+
+    pipeline_end_time = time.time()
+    total_time_seconds = pipeline_end_time - pipeline_start_time
+    minutes = int(total_time_seconds // 60)
+    seconds = int(total_time_seconds % 60)
+
+    print("\n=======================================================")
+    print(f"TOTAL INFERENCE PIPELINE TIME: {minutes} minutes and {seconds} seconds")
+    print("=======================================================")
 
     # --- STAGE 3: Save model ---
     print("\n[Wrap Up] ---------------------------------------------")
@@ -332,6 +337,7 @@ def main():
     print("\nStarting UAV flight test on Batch 2 trajectories...")
     loaded_params = brax_model.load_params(model_path)
 
+    # Standalone Inference Reconstruction
     from brax.training.agents.ppo import networks as ppo_networks
     from brax.training.agents.ppo import train as ppo_train
 
@@ -348,7 +354,6 @@ def main():
     jit_step   = jax.jit(env_2.step)
     jit_policy = jax.jit(policy_fn)
 
-    # Force specific seed for deterministic evaluation spawn point
     rng = jax.random.PRNGKey(123)
     rng, rng_reset = jax.random.split(rng)
     state = jit_reset(rng_reset)
@@ -356,6 +361,7 @@ def main():
 
     rollout = [state.pipeline_state]
 
+    # INCREASED: Allow recording up to 500 frames (5 seconds physics time)
     for step in range(500):
         rng, rng_act = jax.random.split(rng)
         ctrl, _ = jit_policy(state.obs, rng_act)
@@ -374,7 +380,7 @@ def main():
             break
 
     print("Inference flight sequence completed!")
-    
+
     print("\n[Visualization] Generating 3D flight trajectory HTML...")
     html_content = html.render(env_2.sys.tree_replace({'opt.timestep': env_2.dt}), rollout)
     html_path = "uav_flight_trajectory.html"
