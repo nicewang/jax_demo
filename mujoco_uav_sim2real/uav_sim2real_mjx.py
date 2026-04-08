@@ -1,28 +1,38 @@
 """
 UAV Sim2Real Training Demo with MuJoCo XLA (MJX), JAX, Brax using OpenSource Dataset from Hugging Face.
-Optimized drone reinforcement learning training script for TPU v5e-8 / Kaggle TPU v3-8.
+Optimized drone reinforcement learning training script for Kaggle TPU v5e-8.
 """
 
 import os
-# Must be set BEFORE importing JAX
+import warnings
+
+# Suppress Brax deprecation warnings (since we are correctly using MJX backend)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# --- THE REAL OOM KILLER: COMPILER DOWNGRADE ---
+# Stop JAX from pre-allocating all TPU memory
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-# ADD: Disable pmap-based multi-device compilation; Brax 0.14 uses sharding instead
-os.environ["BRAX_DISABLE_PMAP"] = "1"
-# CRITICAL OOM FIX: Force XLA compiler to use fewer threads to avoid blowing up Host RAM during graph compilation
-os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false"
+
+# THIS IS THE KEY TO FIXING THE 300GB+ RAM EXPLOSION:
+# We force the XLA compiler to optimization level 0 (or 1) during LLVM passes.
+# This prevents the compiler from exhaustively unrolling the massive MuJoCo physics graph,
+# which is the actual root cause of Kaggle Kernel Restarts.
+os.environ["XLA_FLAGS"] = (
+    "--xla_cpu_multi_thread_eigen=false "
+    "--xla_backend_optimization_level=0"
+)
 
 import jax
 from jax import numpy as jnp
-# ADD: Import sharding utilities for TPU v5e mesh-based execution
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental import mesh_utils
 import mujoco
 from mujoco import mjx
 
-# ADD: Use PipelineEnv instead of bare Env — required by Brax 0.14.x PPO trainer
+# Use PipelineEnv (required by Brax 0.14.x)
 from brax.envs.base import State, PipelineEnv
-from brax.io import mjcf as brax_mjcf    # ADD: Brax 0.14 uses mjcf loader
+from brax.io import mjcf as brax_mjcf
 from brax.training.agents.ppo import train as ppo
 from brax.io import model as brax_model
 
@@ -135,21 +145,16 @@ UAV_XML = """
 
 # ==========================================
 # 3. Brax/MJX RL Environment
-# FIX: Inherit from PipelineEnv (required by Brax 0.14.x PPO trainer)
-#      instead of bare Env which causes incorrect pmap code path
 # ==========================================
 class UAVTrackingEnv(PipelineEnv):
     def __init__(self, waypoints):
-        # FIX: Load sys via brax mjcf pipeline, required for PipelineEnv
         sys = brax_mjcf.loads(UAV_XML)
-        # FIX: n_frames=1 and backend='mjx' routes computation to MJX on TPU
         super().__init__(sys=sys, backend='mjx', n_frames=1)
         self.waypoints = waypoints
         self.num_waypoints = waypoints.shape[0]
 
     def reset(self, rng: jnp.ndarray) -> State:
         rng, rng_state = jax.random.split(rng)
-        # FIX: Use self.pipeline_init() instead of mjx.make_data() directly
         pipeline_state = self.pipeline_init(
             self.sys.init_q + jax.random.uniform(rng_state, (self.sys.q_size(),), minval=-0.1, maxval=0.1),
             jnp.zeros(self.sys.qd_size())
@@ -167,7 +172,6 @@ class UAVTrackingEnv(PipelineEnv):
         )
 
     def step(self, state: State, action: jnp.ndarray) -> State:
-        # FIX: Use self.pipeline_step() instead of mjx.step() directly
         pipeline_state = self.pipeline_step(state.pipeline_state, action)
         target_idx = state.metrics["target_idx"].astype(jnp.int32)
 
@@ -186,7 +190,6 @@ class UAVTrackingEnv(PipelineEnv):
 
         obs = self._get_obs(pipeline_state, target_idx.astype(jnp.int32))
         
-        # FIX: Must copy existing metrics to preserve keys (like 'reward') added by Brax wrappers
         metrics = state.metrics.copy()
         metrics["target_idx"] = target_idx
         metrics["distance_to_target"] = distance
@@ -209,8 +212,7 @@ class UAVTrackingEnv(PipelineEnv):
 # 4. Main Flow
 # ==========================================
 def main():
-    # ADD: Build a 1D mesh across all 8 TPU cores for sharding-based PPO
-    # This replaces pmap and correctly distributes num_envs across devices
+    # Setup JAX Mesh for proper SPMD parallelization on TPU v5e-8
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names=('batch',))
     print(f"JAX Hardware Devices: {jax.device_count()} TPU cores")
@@ -239,7 +241,9 @@ def main():
     env_1 = UAVTrackingEnv(waypoints_batch1)
     gc.collect()
 
-    # ADD: Wrap ppo.train inside the mesh context so sharding replaces pmap
+    # Wrapped in mesh context for sharding (Opus suggestion)
+    # Math check: num_envs(64) * unroll_length(10) = 640
+    # batch_size(64) * num_minibatches(10) = 640
     with mesh:
         make_inference_fn_1, params_1, _ = ppo.train(
             environment=env_1,
@@ -247,16 +251,16 @@ def main():
             num_evals=2,
             reward_scaling=1.0,
             episode_length=50,
-            normalize_observations=False,  # CRITICAL FIX: MUST BE FALSE to prevent Host RAM OOM
+            normalize_observations=True, 
             action_repeat=1,
-            unroll_length=5,         # Ultra-minimal unroll length to reduce graph size
-            num_minibatches=8,       
+            unroll_length=10,        
+            num_minibatches=10,       
             num_updates_per_batch=2,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
-            num_envs=16,             # CRITICAL FIX: Keep extremely low for TPU compilation memory limit
-            batch_size=10,           # (16 * 5) / 8 minibatches = 10
+            num_envs=64,            
+            batch_size=64,           
             seed=42,
         )
     print("Stage 1 training completed successfully.")
@@ -293,19 +297,19 @@ def main():
             environment=env_2,
             num_timesteps=10_000,
             num_evals=2,
-            restore_params=params_1,  # <--- Inherit weights from Stage 1
+            restore_params=params_1,  # Inherit weights from Stage 1
             reward_scaling=1.0,
             episode_length=50,
-            normalize_observations=False,  # CRITICAL FIX: MUST match Stage 1
+            normalize_observations=True,
             action_repeat=1,
-            unroll_length=5,
-            num_minibatches=8,       
+            unroll_length=10,
+            num_minibatches=10,       
             num_updates_per_batch=2,
             discounting=0.99,
             learning_rate=3e-4,
             entropy_cost=1e-3,
-            num_envs=16,
-            batch_size=10,
+            num_envs=64,
+            batch_size=64,
             seed=99,
         )
     print("Stage 2 continual training completed.")
