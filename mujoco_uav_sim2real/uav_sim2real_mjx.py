@@ -73,9 +73,9 @@ def get_csv_file_lists(repo_id, hf_token=None):
     print(f"Split into two batches: Batch 1 ({len(batch1)} files), Batch 2 ({len(batch2)} files).")
     return batch1, batch2
 
-def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_points=4):
+def download_batch_and_extract(repo_id, file_list, hf_token, num_demo_points=None):
     """
-    Download specified batch of files (multi-threaded), and extract a certain number of waypoints for Demo training.
+    Download specified batch of files (multi-threaded), and extract waypoints for training.
     """
     print(f"\nStarting batch download ({len(file_list)} files in total)...")
     local_dir = snapshot_download(
@@ -90,10 +90,19 @@ def download_batch_and_extract_demo(repo_id, file_list, hf_token, num_demo_point
     if not local_csvs:
         raise FileNotFoundError("Could not find downloaded CSV files locally!")
     print(f"Batch download complete! {len(local_csvs)} related files exist locally.")
-    print(f"Extracting {num_demo_points} trajectory points from the first file ({os.path.basename(local_csvs[0])})...")
-    df = pd.read_csv(local_csvs[0])
-    waypoints = parse_dataframe(df, num_points=num_demo_points)
-    print(f"Successfully extracted {len(waypoints)} waypoints!")
+    
+    # MODIFIED: Iterate through ALL downloaded files instead of just the first one [0]
+    print("Extracting trajectory points from all downloaded files...")
+    waypoints_list = []
+    for f in local_csvs:
+        try:
+            df = pd.read_csv(f)
+            waypoints_list.append(parse_dataframe(df, num_points=num_demo_points))
+        except Exception:
+            pass # Skip corrupted files quietly
+            
+    waypoints = np.concatenate(waypoints_list, axis=0)
+    print(f"Successfully extracted a total of {len(waypoints)} waypoints!")
     return jnp.array(waypoints, dtype=jnp.float32)
 
 # ==========================================
@@ -239,7 +248,7 @@ def main():
     pipeline_start_time = time.time()
 
     print("\n[STAGE 1] ---------------------------------------------")
-    waypoints_batch1 = download_batch_and_extract_demo(REPO_ID, batch1_files, hf_token, num_demo_points=None)
+    waypoints_batch1 = download_batch_and_extract(REPO_ID, batch1_files, hf_token, num_demo_points=None)
 
     print("\nStarting Stage 1 PPO training (Based on Batch 1 data)...")
     env_1 = UAVTrackingEnv(waypoints_batch1)
@@ -289,7 +298,7 @@ def main():
 
     # --- STAGE 2 ---
     print("\n[STAGE 2] ---------------------------------------------")
-    waypoints_batch2 = download_batch_and_extract_demo(REPO_ID, batch2_files, hf_token, num_demo_points=None)
+    waypoints_batch2 = download_batch_and_extract(REPO_ID, batch2_files, hf_token, num_demo_points=None)
 
     print("\nStarting Stage 2 Continual Learning...")
     env_2 = UAVTrackingEnv(waypoints_batch2)
