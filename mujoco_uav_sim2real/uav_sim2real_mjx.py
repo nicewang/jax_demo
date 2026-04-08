@@ -17,6 +17,12 @@ import numpy as np
 import ast
 import time
 import os
+import gc  # Added for forced garbage collection
+
+# Restrict JAX from pre-allocating all memory to mitigate Out-Of-Memory (OOM) issues
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform" # Forces JAX to use the system memory allocator
+
 import glob
 from huggingface_hub import HfApi, snapshot_download # The ultimate solution for massive file repositories
 
@@ -239,22 +245,27 @@ def main():
     print("\nStarting Stage 1 PPO training (Based on Batch 1 data)...")
     env_1 = UAVTrackingEnv(waypoints_batch1)
     
+    # Force Garbage Collection before heavy XLA compilation
+    gc.collect()
+    
+    # EXTREME MEMORY SAVING MODE: 
+    # Ensuring that num_envs * unroll_length == batch_size * num_minibatches (64*10 == 64*10)
     make_inference_fn_1, params_1, _ = ppo.train(
         environment=env_1,
-        num_timesteps=50_000,   
+        num_timesteps=20_000,    # Reduced further for a lightning-fast compilation demo
         num_evals=5,
         reward_scaling=1.0,
-        episode_length=200,      
+        episode_length=100,      # Reduced to minimize graph size
         normalize_observations=True,
         action_repeat=1,
-        unroll_length=20,
-        num_minibatches=32,        
+        unroll_length=10,        # Minimal unroll
+        num_minibatches=10,      # Perfectly balanced with num_envs and batch_size  
         num_updates_per_batch=4,
         discounting=0.99,
         learning_rate=3e-4,
         entropy_cost=1e-3,
-        num_envs=2048,
-        batch_size=1024,
+        num_envs=64,             # Ultra-low to absolutely prevent Host RAM OOM 
+        batch_size=64,           # Scaled to exactly match 
         seed=42,
     )
     print("Stage 1 training completed successfully.")
@@ -280,24 +291,27 @@ def main():
     print("\nStarting Stage 2 Continual Learning...")
     env_2 = UAVTrackingEnv(waypoints_batch2)
     
+    # Force Garbage Collection before the second compilation
+    gc.collect()
+    
     # CORE: Pass restore_params=params_1 to inherit memories from Stage 1
     make_inference_fn_2, params_2, _ = ppo.train(
         environment=env_2,
-        num_timesteps=50_000,   
+        num_timesteps=20_000,   
         num_evals=5,
         restore_params=params_1,  # <--- Inherit old weights here
         reward_scaling=1.0,
-        episode_length=200,      
+        episode_length=100,      
         normalize_observations=True,
         action_repeat=1,
-        unroll_length=20,
-        num_minibatches=32,        
+        unroll_length=10,        
+        num_minibatches=10,        
         num_updates_per_batch=4,
         discounting=0.99,
         learning_rate=3e-4,
         entropy_cost=1e-3,
-        num_envs=2048,
-        batch_size=1024,
+        num_envs=64,             
+        batch_size=64,          
         seed=99,
     )
     print("Stage 2 continual training completed.")
@@ -323,12 +337,12 @@ def main():
     state = jit_reset(rng_reset)
     print("UAV Takeoff!")
     
-    for step in range(200):
+    for step in range(100):
         rng, rng_act = jax.random.split(rng)
         ctrl, _ = jit_policy(state.obs, rng_act)
         state = jit_step(state, ctrl)
         
-        if step % 20 == 0:
+        if step % 10 == 0:
             dist = state.metrics['distance_to_target']
             target_idx = state.metrics['target_idx']
             print(f"Time Step {step:03d} | Tracking Waypoint {target_idx} | Distance Error: {dist:.3f} m")
